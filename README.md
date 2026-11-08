@@ -371,6 +371,9 @@ client.add(1, 2, [&](AddResult result) {
 - 异步方法和同步方法不能注册相同的service/method
 - 请求超时时，客户端先发送 Cancel 帧；随后 callback 收到 "rpc request timeout" 失败响应。
 - 服务端收到 Cancel 帧后，会将对应活动异步请求的 RpcCancellationToken 标记为已取消；之后的 reply 不发送响应。
+- 调用 `stop()` 后，服务端拒绝已有连接上的新请求，并给已登记的请求留出回复时间。
+- 已登记的请求全部结束后，服务端立即开始优雅关闭连接。宽限期到期时仍有请求未完成，服务端会取消未完成的异步请求，并强制关闭剩余连接。
+- TCP 服务停止完成后，若配置了业务线程池，还需等所有 worker 退出。满足这些条件后，`RpcServer` 在 base loop 中调用 `stopCompleteCallback`。
 
 ## 当前限制
 

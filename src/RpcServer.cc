@@ -5,42 +5,352 @@
 #include <mutex>
 #include <optional>
 
-enum class RegisterTokenStatus {
+bool RpcCancellationToken::isCanceled() const { return canceled_->load(); }
+
+RpcCancellationToken::RpcCancellationToken(
+    std::shared_ptr<std::atomic<bool>> canceled) {
+  canceled_ = std::move(canceled);
+}
+
+enum class RequestKind { kSync, kAsync };
+
+enum class RegistrationStatus {
   kRegistered,
+  kNotAccepting,
   kDuplicateRequestId,
   kGlobalLimitReached,
   kConnectionLimitReached
 };
 
-class CancellationRegistry {
+// 一次登记对应一个对象。
+// 同步请求的 cancellation 为 std::nullopt。
+struct RequestRecord {
+  RequestKind kind;
+  std::optional<RpcCancellationToken> cancellation;
+};
+
+// 通过这个指针不能修改记录中的字段。
+// token 的取消状态仍由 registry 通过其内部原子变量修改。
+using RequestRecordPtr = std::shared_ptr<const RequestRecord>;
+
+struct RegistrationResult {
+  RegistrationStatus status;
+  RequestRecordPtr record; // 登记失败时为空
+};
+
+class ServerRequestRegistry {
+  friend class RpcServer;
+
 public:
-  explicit CancellationRegistry() = default;
+  RegistrationResult tryRegister(const TcpConnectionPtr &conn,
+                                 uint64_t requestId, RequestKind kind);
 
-  std::optional<RpcCancellationToken> take(const TcpConnectionPtr &conn,
-                                           uint64_t requestId);
-  RegisterTokenStatus registerToken(const TcpConnectionPtr &conn,
-                                    uint64_t requestId,
-                                    RpcCancellationToken token);
+  // 是否仍然是表中有效的那次登记。
+  bool contains(const TcpConnectionPtr &conn, uint64_t requestId,
+                const RequestRecordPtr &expected);
 
-  void cancel(const TcpConnectionPtr &conn, uint64_t requestId);
+  // 返回 true 表示：
+  // 本次完成使登记表在停止接收后变空，需要通知停止流程。
+  // 它不是“删除成功”的返回值。
+  bool finish(const TcpConnectionPtr &conn, uint64_t requestId,
+              const RequestRecordPtr &expected);
 
-  void clearConnectionCancellations(const TcpConnectionPtr &conn);
+  // 返回 true 表示：本次取消使登记表在停止接收后变空。
+  // 不表示“是否取消成功”。
+  bool cancel(const TcpConnectionPtr &conn, uint64_t requestId);
+
+  // 停止接受新登记。
+  // 返回 true 表示此时已经没有任何请求需要等待。
+  bool stopAccepting();
+
+  // 连接彻底断开后，移除该连接的全部请求。
+  // 返回 true 表示本次清理使登记表在停止接收后变空。
+  bool clearConnection(const TcpConnectionPtr &conn);
+
+  // 停止期限到达后，取消所有剩余异步请求并清空全部记录。
+  // 同时确保不再接受新登记。
+  void cancelAll();
+
+private:
+  struct ConnectionRequests {
+    std::unordered_map<uint64_t, RequestRecordPtr> records;
+    size_t activeAsyncRequests = 0;
+  };
+
+  std::mutex mutex_;
+  bool acceptingRequests_ = true;
+
+  // 保留现有“活动异步请求上限”的含义。
+  size_t activeAsyncRequests_ = 0;
+  std::optional<size_t> maxActiveAsyncRequests_;
+  std::optional<size_t> maxActiveAsyncRequestsPerConnection_;
+
+  std::unordered_map<TcpConnectionPtr, ConnectionRequests>
+      requestsByConnection_;
+};
+
+RegistrationResult
+ServerRequestRegistry::tryRegister(const TcpConnectionPtr &conn,
+                                   uint64_t requestId, RequestKind kind) {
+  assert(conn);
+  assert(kind == RequestKind::kSync || kind == RequestKind::kAsync);
+
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+
+  // 优先识别尚未结束的重复请求。
+  if (connIt != requestsByConnection_.end() &&
+      connIt->second.records.find(requestId) != connIt->second.records.end()) {
+    return {RegistrationStatus::kDuplicateRequestId, nullptr};
+  }
+
+  if (!acceptingRequests_) {
+    return {RegistrationStatus::kNotAccepting, nullptr};
+  }
+
+  // 现有上限只约束异步请求。
+  if (kind == RequestKind::kAsync) {
+    if (maxActiveAsyncRequests_.has_value() &&
+        activeAsyncRequests_ >= *maxActiveAsyncRequests_) {
+      return {RegistrationStatus::kGlobalLimitReached, nullptr};
+    }
+
+    const size_t connectionAsyncRequests =
+        connIt == requestsByConnection_.end()
+            ? 0
+            : connIt->second.activeAsyncRequests;
+
+    if (maxActiveAsyncRequestsPerConnection_.has_value() &&
+        connectionAsyncRequests >= *maxActiveAsyncRequestsPerConnection_) {
+      return {RegistrationStatus::kConnectionLimitReached, nullptr};
+    }
+  }
+
+  std::optional<RpcCancellationToken> cancellation;
+
+  if (kind == RequestKind::kAsync) {
+    cancellation =
+        RpcCancellationToken(std::make_shared<std::atomic<bool>>(false));
+  }
+
+  auto record = std::make_shared<const RequestRecord>(
+      RequestRecord{kind, std::move(cancellation)});
+
+  if (connIt == requestsByConnection_.end()) {
+    // 先在局部准备好记录，再把连接项放入总表。
+    ConnectionRequests connectionRequests;
+    connectionRequests.records.emplace(requestId, record);
+
+    connIt = requestsByConnection_.emplace(conn, std::move(connectionRequests))
+                 .first;
+  } else {
+    connIt->second.records.emplace(requestId, record);
+  }
+
+  // 插入成功后才更新计数。
+  if (kind == RequestKind::kAsync) {
+    ++connIt->second.activeAsyncRequests;
+    ++activeAsyncRequests_;
+  }
+
+  return {RegistrationStatus::kRegistered, std::move(record)};
+}
+
+bool ServerRequestRegistry::contains(const TcpConnectionPtr &conn,
+                                     uint64_t requestId,
+                                     const RequestRecordPtr &expected) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+  if (connIt == requestsByConnection_.end()) {
+    return false;
+  }
+
+  const auto &records = connIt->second.records;
+  auto requestIt = records.find(requestId);
+
+  return requestIt != records.end() && requestIt->second == expected;
+}
+
+bool ServerRequestRegistry::finish(const TcpConnectionPtr &conn,
+                                   uint64_t requestId,
+                                   const RequestRecordPtr &expected) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+  if (connIt == requestsByConnection_.end()) {
+    return false;
+  }
+
+  auto &connectionRequests = connIt->second;
+  auto requestIt = connectionRequests.records.find(requestId);
+
+  if (requestIt == connectionRequests.records.end()) {
+    return false;
+  }
+
+  // ID 相同还不够，必须是当初登记的同一份记录。
+  if (requestIt->second != expected) {
+    return false;
+  }
+
+  if (requestIt->second->kind == RequestKind::kAsync) {
+    --connectionRequests.activeAsyncRequests;
+    --activeAsyncRequests_;
+  }
+
+  connectionRequests.records.erase(requestIt);
+
+  if (connectionRequests.records.empty()) {
+    requestsByConnection_.erase(connIt);
+  }
+
+  return !acceptingRequests_ && requestsByConnection_.empty();
+}
+
+bool ServerRequestRegistry::cancel(const TcpConnectionPtr &conn,
+                                   uint64_t requestId) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+  if (connIt == requestsByConnection_.end()) {
+    return false;
+  }
+
+  auto &connectionRequests = connIt->second;
+  auto requestIt = connectionRequests.records.find(requestId);
+
+  if (requestIt == connectionRequests.records.end()) {
+    return false;
+  }
+
+  const auto &record = requestIt->second;
+
+  // 当前只支持取消异步请求。
+  if (record->kind != RequestKind::kAsync) {
+    return false;
+  }
+
+  assert(record->cancellation.has_value());
+
+  // 先通知业务任务：该请求已经被取消。
+  record->cancellation->canceled_->store(true);
+
+  --connectionRequests.activeAsyncRequests;
+  --activeAsyncRequests_;
+
+  connectionRequests.records.erase(requestIt);
+
+  if (connectionRequests.records.empty()) {
+    requestsByConnection_.erase(connIt);
+  }
+
+  return !acceptingRequests_ && requestsByConnection_.empty();
+}
+
+bool ServerRequestRegistry::stopAccepting() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  acceptingRequests_ = false;
+
+  return requestsByConnection_.empty();
+}
+
+bool ServerRequestRegistry::clearConnection(const TcpConnectionPtr &conn) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+  if (connIt == requestsByConnection_.end()) {
+    return false;
+  }
+
+  const auto &connectionRequests = connIt->second;
+  for (const auto &entry : connectionRequests.records) {
+    const auto &record = entry.second;
+
+    if (record->cancellation.has_value()) {
+      record->cancellation->canceled_->store(true);
+    }
+  }
+
+  assert(activeAsyncRequests_ >= connectionRequests.activeAsyncRequests);
+
+  activeAsyncRequests_ -= connectionRequests.activeAsyncRequests;
+  requestsByConnection_.erase(connIt);
+
+  return !acceptingRequests_ && requestsByConnection_.empty();
+}
+
+void ServerRequestRegistry::cancelAll() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  acceptingRequests_ = false;
+
+  for (const auto &connectionEntry : requestsByConnection_) {
+    const auto &connectionRequests = connectionEntry.second;
+    for (const auto &entry : connectionRequests.records) {
+      const auto &record = entry.second;
+
+      if (record->cancellation.has_value()) {
+        record->cancellation->canceled_->store(true);
+      }
+    }
+  }
+
+  requestsByConnection_.clear();
+  activeAsyncRequests_ = 0;
+}
+
+class ReplyDispatcher {
+public:
+  explicit ReplyDispatcher();
+
+  bool tryQueue(const TcpConnectionPtr &conn, EventLoop::Functor functor);
+
+  bool tryQueue(EventLoop *loop, EventLoop::Functor functor);
+
+  void close();
 
 private:
   std::mutex mutex_;
-  std::optional<uint64_t> maxActiveRequests_;
-  std::optional<uint64_t> maxActiveRequestsPerConnection_;
-  std::map<TcpConnectionPtr, std::unordered_map<uint64_t, RpcCancellationToken>>
-      cancellations_;
-  friend class RpcServer;
+  bool running_;
 };
+
+ReplyDispatcher::ReplyDispatcher() : running_(true) {}
+
+bool ReplyDispatcher::tryQueue(const TcpConnectionPtr &conn,
+                               EventLoop::Functor functor) {
+  std::lock_guard<std::mutex> locker(mutex_);
+
+  if (!running_) {
+    return false;
+  }
+
+  conn->loop()->queueInLoop(std::move(functor));
+  return true;
+}
+
+bool ReplyDispatcher::tryQueue(EventLoop *loop, EventLoop::Functor functor) {
+  std::lock_guard<std::mutex> locker(mutex_);
+
+  if (!running_) {
+    return false;
+  }
+
+  loop->queueInLoop(std::move(functor));
+  return true;
+}
+
+void ReplyDispatcher::close() {
+  std::lock_guard<std::mutex> locker(mutex_);
+  running_ = false;
+}
 
 namespace {
 void sendFramedData(const TcpConnectionPtr &conn, uint64_t requestId,
                     ResponseResult responseResult, RpcErrorCode errorCode,
                     std::string payload, std::string errorMessage,
                     size_t maxMessageSize) {
-
   size_t outputMessageLen =
       RpcResponse::OutputMessageLen(payload.length(), errorMessage.length());
   if (outputMessageLen > maxMessageSize) {
@@ -83,127 +393,25 @@ void sendFramedData(const TcpConnectionPtr &conn, uint64_t requestId,
     codec.send(conn, outputMessage.data(), outputMessage.length());
   }
 }
+
+bool completeRequestInLoop(
+    const std::shared_ptr<ServerRequestRegistry> &serverRequestRegistry,
+    const RequestRecordPtr &record, const TcpConnectionPtr &conn,
+    uint64_t requestId, ResponseResult responseResult, RpcErrorCode errorCode,
+    std::string payload, std::string errorMessage, size_t maxMessageSize) {
+  assert(conn->loop()->isInLoopThread());
+
+  bool contain = serverRequestRegistry->contains(conn, requestId, record);
+  if (!contain) {
+    return false;
+  }
+
+  sendFramedData(conn, requestId, responseResult, errorCode, std::move(payload),
+                 std::move(errorMessage), maxMessageSize);
+
+  return serverRequestRegistry->finish(conn, requestId, record);
+}
 } // namespace
-
-bool RpcCancellationToken::isCanceled() const { return canceled_->load(); }
-
-RpcCancellationToken::RpcCancellationToken(
-    std::shared_ptr<std::atomic<bool>> canceled) {
-  canceled_ = std::move(canceled);
-}
-
-std::optional<RpcCancellationToken>
-CancellationRegistry::take(const TcpConnectionPtr &conn, uint64_t requestId) {
-  std::lock_guard<std::mutex> locker(mutex_);
-
-  std::optional<RpcCancellationToken> value;
-
-  auto connFindRes = cancellations_.find(conn);
-  if (connFindRes == cancellations_.end()) {
-    return value;
-  }
-
-  auto requestFindRes = connFindRes->second.find(requestId);
-  if (requestFindRes == connFindRes->second.end()) {
-    return value;
-  }
-
-  value.emplace(requestFindRes->second);
-  connFindRes->second.erase(requestFindRes);
-
-  if (connFindRes->second.size() == 0) {
-    cancellations_.erase(connFindRes);
-  }
-
-  return value;
-}
-
-RegisterTokenStatus
-CancellationRegistry::registerToken(const TcpConnectionPtr &conn,
-                                    uint64_t requestId,
-                                    RpcCancellationToken token) {
-  std::lock_guard<std::mutex> locker(mutex_);
-
-  auto connFindRes = cancellations_.find(conn);
-
-  // 已有连接时，先识别重复 requestId。
-  if (connFindRes != cancellations_.end()) {
-    auto requestFindRes = connFindRes->second.find(requestId);
-    if (requestFindRes != connFindRes->second.end()) {
-      return RegisterTokenStatus::kDuplicateRequestId;
-    }
-  }
-
-  // 检查全局活动异步请求上限。
-  if (maxActiveRequests_.has_value()) {
-    uint64_t activeRequests = 0;
-    for (const auto &item : cancellations_) {
-      activeRequests += item.second.size();
-    }
-
-    if (activeRequests >= maxActiveRequests_.value()) {
-      return RegisterTokenStatus::kGlobalLimitReached;
-    }
-  }
-
-  // 仅已有连接项才需要检查其当前请求数。
-  if (connFindRes != cancellations_.end() &&
-      maxActiveRequestsPerConnection_.has_value() &&
-      connFindRes->second.size() >= maxActiveRequestsPerConnection_.value()) {
-    return RegisterTokenStatus::kConnectionLimitReached;
-  }
-
-  // 所有检查通过后，才为新连接创建内层 map。
-  if (connFindRes == cancellations_.end()) {
-    connFindRes =
-        cancellations_
-            .emplace(conn, std::unordered_map<uint64_t, RpcCancellationToken>{})
-            .first;
-  }
-
-  connFindRes->second.emplace(requestId, std::move(token));
-  return RegisterTokenStatus::kRegistered;
-}
-
-void CancellationRegistry::cancel(const TcpConnectionPtr &conn,
-                                  uint64_t requestId) {
-  std::lock_guard<std::mutex> locker(mutex_);
-
-  auto connFindRes = cancellations_.find(conn);
-  if (connFindRes == cancellations_.end()) {
-    return;
-  }
-
-  auto requestFindRes = connFindRes->second.find(requestId);
-  if (requestFindRes == connFindRes->second.end()) {
-    return;
-  }
-
-  requestFindRes->second.canceled_->store(true);
-
-  connFindRes->second.erase(requestFindRes);
-  if (connFindRes->second.size() == 0) {
-    cancellations_.erase(connFindRes);
-  }
-}
-
-void CancellationRegistry::clearConnectionCancellations(
-    const TcpConnectionPtr &conn) {
-  std::lock_guard<std::mutex> locker(mutex_);
-
-  auto connFindRes = cancellations_.find(conn);
-
-  if (connFindRes == cancellations_.end()) {
-    return;
-  }
-
-  for (auto it = connFindRes->second.begin(); it != connFindRes->second.end();
-       ++it) {
-    it->second.canceled_->store(true);
-  }
-
-  cancellations_.erase(conn);
-}
 
 RpcServer::RpcServer(EventLoop *loop, int listenFd, int threadNum)
     : loop_(loop), status_(Status::kNotStarted), tcpServerStopped_(false),
@@ -213,9 +421,12 @@ RpcServer::RpcServer(EventLoop *loop, int listenFd, int threadNum)
   assert(threadNum >= 0);
   loop_->assertInLoopThread();
 
-  server_ = std::make_unique<TcpServer>(loop, listenFd, threadNum);
-  cancellationRegistry_ = std::make_shared<CancellationRegistry>();
   maxMessageSize_ = std::make_shared<std::optional<size_t>>();
+  server_ = std::make_unique<TcpServer>(loop, listenFd, threadNum);
+  serverRequestRegistry_ = std::make_shared<ServerRequestRegistry>();
+  replyDispatcher_ = std::make_shared<ReplyDispatcher>();
+  drainedFunctor_ =
+      std::make_shared<std::function<void()>>([this] { onRequestsDrained(); });
 
   lengthHeaderCodec_.setMessageCallback(std::bind(&RpcServer::onRpcMessage,
                                                   this, std::placeholders::_1,
@@ -224,12 +435,16 @@ RpcServer::RpcServer(EventLoop *loop, int listenFd, int threadNum)
       std::bind(&LengthHeaderCodec::onMessage, &lengthHeaderCodec_,
                 std::placeholders::_1, std::placeholders::_2));
 
-  auto registry = cancellationRegistry_;
-  server_->setConnectionCallback([registry](const TcpConnectionPtr &conn) {
-    if (!conn->connected()) {
-      registry->clearConnectionCancellations(conn);
-    }
-  });
+  server_->setConnectionCallback(
+      [this, serverRequestRegistry =
+                 serverRequestRegistry_](const TcpConnectionPtr &conn) {
+        if (!conn->connected()) {
+          bool isDrained = serverRequestRegistry->clearConnection(conn);
+          if (isDrained) {
+            loop_->queueInLoop([this]() { onRequestsDrained(); });
+          }
+        }
+      });
 
   server_->setPeerHalfCloseCallback(
       [](const TcpConnectionPtr &conn) { conn->shutdown(); });
@@ -257,18 +472,21 @@ void RpcServer::stop(std::chrono::milliseconds gracePeriod) {
   if (status_ != Status::kRunning) {
     return;
   }
-  status_ = Status::kStopping;
+  status_ = Status::kDraining;
 
-  if (taskPool_) {
-    taskPoolStopThread_ = std::thread([&]() {
-      taskPool_->stop();
-      loop_->queueInLoop([&]() { onTaskPoolStopped(); });
-    });
-  } else {
-    onTaskPoolStopped();
+  stopDeadline_ = std::chrono::steady_clock::now() + gracePeriod;
+
+  server_->stopAccepting();
+  bool res = serverRequestRegistry_->stopAccepting();
+  if (res || gracePeriod == std::chrono::milliseconds(0)) {
+    beginClosing();
+    return;
   }
 
-  server_->stop(gracePeriod);
+  stopTaskId = loop_->runAfter(gracePeriod, [&]() {
+    stopTaskId.reset();
+    beginClosing();
+  });
 }
 
 void RpcServer::setStopCompleteCallback(StopCompleteCallback cb) {
@@ -396,7 +614,7 @@ void RpcServer::setMaxActiveRequests(size_t maxActiveRequests) {
   assert(status_ == Status::kNotStarted);
   assert(maxActiveRequests > 0);
 
-  cancellationRegistry_->maxActiveRequests_ = maxActiveRequests;
+  serverRequestRegistry_->maxActiveAsyncRequests_ = maxActiveRequests;
 }
 
 void RpcServer::setMaxActiveRequestsPerConnection(size_t maxActiveRequests) {
@@ -404,7 +622,8 @@ void RpcServer::setMaxActiveRequestsPerConnection(size_t maxActiveRequests) {
   assert(status_ == Status::kNotStarted);
   assert(maxActiveRequests > 0);
 
-  cancellationRegistry_->maxActiveRequestsPerConnection_ = maxActiveRequests;
+  serverRequestRegistry_->maxActiveAsyncRequestsPerConnection_ =
+      maxActiveRequests;
 }
 
 void RpcServer::setMaxMessageSize(size_t maxMessageSize) {
@@ -503,7 +722,6 @@ void RpcServer::sendResponse(const TcpConnectionPtr &conn, uint64_t requestId,
                              ResponseResult responseResult,
                              RpcErrorCode errorCode, std::string payload,
                              std::string errorMessage) {
-
   size_t outputMessageLen =
       RpcResponse::OutputMessageLen(payload.length(), errorMessage.length());
   size_t effectiveMaxMessageSize =
@@ -588,12 +806,47 @@ void RpcServer::invokeSyncHandler(const TcpConnectionPtr &conn,
   auto serviceItr = syncHandlers_.find(request.getService());
   auto handler = serviceItr->second.find(request.getMethod())->second;
 
+  RegistrationResult result = serverRequestRegistry_->tryRegister(
+      conn, request.getRequestId(), RequestKind::kSync);
+
+  if (result.status != RegistrationStatus::kRegistered) {
+    RpcErrorCode errorCode = RpcErrorCode::INTERNAL_ERROR;
+    std::string errorMessage;
+    if (result.status == RegistrationStatus::kNotAccepting) {
+      errorMessage = "server stopping";
+    } else if (result.status == RegistrationStatus::kDuplicateRequestId) {
+      conn->forceClose();
+      return;
+    } else if (result.status == RegistrationStatus::kGlobalLimitReached) {
+      errorCode = RpcErrorCode::RESOURCE_EXHAUSTED;
+      errorMessage = "global limit reached";
+    } else if (result.status == RegistrationStatus::kConnectionLimitReached) {
+      errorCode = RpcErrorCode::RESOURCE_EXHAUSTED;
+      errorMessage = "connection limit reached";
+    }
+
+    sendResponse(conn, request.getRequestId(), ResponseResult::kUnsuccess,
+                 errorCode, "", errorMessage);
+
+    return;
+  }
+
   RpcResult rpcResult;
   try {
     rpcResult = handler(request.getPayload());
   } catch (...) {
-    sendResponse(conn, request.getRequestId(), ResponseResult::kUnsuccess,
-                 RpcErrorCode::INTERNAL_ERROR, "", "handler exception");
+    // sendResponse(conn, request.getRequestId(), ResponseResult::kUnsuccess,
+    //              RpcErrorCode::INTERNAL_ERROR, "", "handler exception");
+
+    bool isDrained = completeRequestInLoop(
+        serverRequestRegistry_, result.record, conn, request.getRequestId(),
+        ResponseResult::kUnsuccess, RpcErrorCode::INTERNAL_ERROR, "",
+        "handler exception",
+        maxMessageSize_->value_or(LengthHeaderCodec::kMaxMessageSize));
+
+    if (isDrained) {
+      loop_->queueInLoop([this]() { onRequestsDrained(); });
+    }
     return;
   }
 
@@ -608,14 +861,30 @@ void RpcServer::invokeSyncHandler(const TcpConnectionPtr &conn,
        rpcResult.errorCode != RpcErrorCode::NO_ERROR) ||
       (rpcResult.result == ResponseResult::kUnsuccess &&
        rpcResult.errorCode == RpcErrorCode::NO_ERROR)) {
-    sendResponse(conn, request.getRequestId(), ResponseResult::kUnsuccess,
-                 RpcErrorCode::INTERNAL_ERROR, "", "invalid handler result");
+    // sendResponse(conn, request.getRequestId(), ResponseResult::kUnsuccess,
+    //              RpcErrorCode::INTERNAL_ERROR, "", "invalid handler result");
+
+    bool isDrained = completeRequestInLoop(
+        serverRequestRegistry_, result.record, conn, request.getRequestId(),
+        ResponseResult::kUnsuccess, RpcErrorCode::INTERNAL_ERROR, "",
+        "invalid handler result",
+        maxMessageSize_->value_or(LengthHeaderCodec::kMaxMessageSize));
+
+    if (isDrained) {
+      loop_->queueInLoop([this]() { onRequestsDrained(); });
+    }
     return;
   }
 
-  sendResponse(conn, request.getRequestId(), rpcResult.result,
-               rpcResult.errorCode, std::move(rpcResult.payload),
-               std::move(rpcResult.errorMessage));
+  bool isDrained = completeRequestInLoop(
+      serverRequestRegistry_, result.record, conn, request.getRequestId(),
+      rpcResult.result, rpcResult.errorCode, std::move(rpcResult.payload),
+      std::move(rpcResult.errorMessage),
+      maxMessageSize_->value_or(LengthHeaderCodec::kMaxMessageSize));
+
+  if (isDrained) {
+    loop_->queueInLoop([this]() { onRequestsDrained(); });
+  }
 }
 
 void RpcServer::invokeAsyncHandler(const TcpConnectionPtr &conn,
@@ -623,40 +892,55 @@ void RpcServer::invokeAsyncHandler(const TcpConnectionPtr &conn,
   auto serviceItr = asyncHandlers_.find(request.getService());
   auto handler = serviceItr->second.find(request.getMethod())->second;
 
-  std::weak_ptr<TcpConnection> weakPtr = conn;
+  std::weak_ptr<TcpConnection> connWeakPtr = conn;
   uint64_t requestId = request.getRequestId();
 
-  RpcCancellationToken cancellationToken(
-      std::make_shared<std::atomic<bool>>(false));
-  RegisterTokenStatus res =
-      cancellationRegistry_->registerToken(conn, requestId, cancellationToken);
+  RegistrationResult result = serverRequestRegistry_->tryRegister(
+      conn, request.getRequestId(), RequestKind::kAsync);
 
-  if (res != RegisterTokenStatus::kRegistered) {
-    if (res == RegisterTokenStatus::kDuplicateRequestId) {
+  if (result.status != RegistrationStatus::kRegistered) {
+    RpcErrorCode errorCode = RpcErrorCode::INTERNAL_ERROR;
+    std::string errorMessage;
+    if (result.status == RegistrationStatus::kNotAccepting) {
+      errorMessage = "server stopping";
+    } else if (result.status == RegistrationStatus::kDuplicateRequestId) {
       conn->forceClose();
-    } else if (res == RegisterTokenStatus::kConnectionLimitReached ||
-               res == RegisterTokenStatus::kGlobalLimitReached) {
-      sendResponse(conn, request.getRequestId(), ResponseResult::kUnsuccess,
-                   RpcErrorCode::RESOURCE_EXHAUSTED, "",
-                   "server request limit reached");
+      return;
+    } else if (result.status == RegistrationStatus::kGlobalLimitReached) {
+      errorCode = RpcErrorCode::RESOURCE_EXHAUSTED;
+      errorMessage = "server request limit reached";
+    } else if (result.status == RegistrationStatus::kConnectionLimitReached) {
+      errorCode = RpcErrorCode::RESOURCE_EXHAUSTED;
+      errorMessage = "server request limit reached";
     }
+
+    sendResponse(conn, request.getRequestId(), ResponseResult::kUnsuccess,
+                 errorCode, "", errorMessage);
     return;
   }
 
-  std::weak_ptr<CancellationRegistry> weakCancellationRegistryPtr =
-      cancellationRegistry_;
+  std::weak_ptr<ServerRequestRegistry> weakServerRequestRegistryPtr =
+      serverRequestRegistry_;
+  std::weak_ptr<ReplyDispatcher> weakReplyDispatcherPtr = replyDispatcher_;
   std::weak_ptr<std::optional<size_t>> weakMaxMessageSizePtr = maxMessageSize_;
+  std::weak_ptr<std::function<void()>> drainedFunctorPtr = drainedFunctor_;
 
   std::shared_ptr<std::atomic<bool>> repliedFlag =
       std::make_shared<std::atomic<bool>>(false);
   std::function<void(RpcResult)> reply =
-      [weakPtr, requestId, repliedFlag, weakCancellationRegistryPtr,
-       weakMaxMessageSizePtr](RpcResult rpcResult) -> void {
+      [baseLoop = loop_, weakServerRequestRegistryPtr, record = result.record,
+       connWeakPtr, requestId, repliedFlag, weakMaxMessageSizePtr,
+       weakReplyDispatcherPtr, drainedFunctorPtr](RpcResult rpcResult) -> void {
+    auto replyDispatcher = weakReplyDispatcherPtr.lock();
+    if (!replyDispatcher) {
+      return;
+    }
+
     if (repliedFlag->exchange(true)) {
       return;
     }
 
-    auto conn = weakPtr.lock();
+    auto conn = connWeakPtr.lock();
     if (!conn) {
       return;
     }
@@ -676,36 +960,51 @@ void RpcServer::invokeAsyncHandler(const TcpConnectionPtr &conn,
                    "invalid handler result"};
     }
 
-    conn->loop()->queueInLoop(
-        [conn, requestId, rpcResult = std::move(rpcResult),
-         weakCancellationRegistryPtr, weakMaxMessageSizePtr]() mutable {
-          auto registry = weakCancellationRegistryPtr.lock();
-          if (!registry) {
+    replyDispatcher->tryQueue(
+        conn, [baseLoop, weakServerRequestRegistryPtr, record, conn, requestId,
+               rpcResult = std::move(rpcResult), weakMaxMessageSizePtr,
+               drainedFunctorPtr, weakReplyDispatcherPtr]() mutable {
+          auto serverRequestRegistry = weakServerRequestRegistryPtr.lock();
+          if (!serverRequestRegistry) {
             return;
           }
+
           auto maxMessageSize = weakMaxMessageSizePtr.lock();
           if (!maxMessageSize) {
-            return;
-          }
-
-          auto token = registry->take(conn, requestId);
-
-          if (!token.has_value() || token->isCanceled()) {
             return;
           }
 
           size_t effectiveMaxMessageSize =
               maxMessageSize->value_or(LengthHeaderCodec::kMaxMessageSize);
 
-          sendFramedData(conn, requestId, rpcResult.result, rpcResult.errorCode,
-                         std::move(rpcResult.payload),
-                         std::move(rpcResult.errorMessage),
-                         effectiveMaxMessageSize);
+          bool isDrained = completeRequestInLoop(
+              serverRequestRegistry, record, conn, requestId, rpcResult.result,
+              rpcResult.errorCode, std::move(rpcResult.payload),
+              std::move(rpcResult.errorMessage), effectiveMaxMessageSize);
+          if (isDrained) {
+            auto replyDispatcher = weakReplyDispatcherPtr.lock();
+            if (!replyDispatcher) {
+              return;
+            }
+
+            replyDispatcher->tryQueue(baseLoop, [drainedFunctorPtr]() {
+              auto drainedFunctor = drainedFunctorPtr.lock();
+              if (!drainedFunctor) {
+                return;
+              }
+
+              (*drainedFunctor)();
+            });
+          }
         });
   };
 
-  auto functor = [request, handler, reply, token = cancellationToken]() {
+  auto functor = [request, handler, reply,
+                  token = result.record->cancellation.value()]() {
     try {
+      if (token.isCanceled()) {
+        return;
+      }
       handler(request.getPayload(), token, reply);
     } catch (...) {
       reply(RpcServer::RpcResult{ResponseResult::kUnsuccess,
@@ -744,7 +1043,11 @@ void RpcServer::invokeAsyncHandler(const TcpConnectionPtr &conn,
 }
 
 void RpcServer::cancelAsync(const TcpConnectionPtr &conn, uint64_t requestId) {
-  cancellationRegistry_->cancel(conn, requestId);
+  bool isDrained = serverRequestRegistry_->cancel(conn, requestId);
+
+  if (isDrained) {
+    loop_->queueInLoop([this]() { onRequestsDrained(); });
+  }
 }
 
 void RpcServer::onTcpServerStopped() {
@@ -771,8 +1074,54 @@ void RpcServer::tryCompleteStop() {
     }
 
     status_ = Status::kStopped;
+    drainedFunctor_.reset();
     if (stopCompleteCallback_) {
       stopCompleteCallback_();
     }
   }
+}
+
+void RpcServer::onRequestsDrained() {
+  assert(loop_->isInLoopThread());
+
+  if (status_ == Status::kDraining) {
+    beginClosing();
+  }
+}
+
+void RpcServer::beginClosing() {
+  assert(loop_->isInLoopThread());
+
+  if (status_ != Status::kDraining) {
+    return;
+  }
+
+  status_ = Status::kStopping;
+
+  if (stopTaskId.has_value()) {
+    loop_->cancel(stopTaskId.value());
+    stopTaskId.reset();
+  }
+
+  replyDispatcher_->close();
+
+  const auto now = std::chrono::steady_clock::now();
+  std::chrono::milliseconds gracePeriod{0};
+  if (now < stopDeadline_.value()) {
+    gracePeriod = std::chrono::duration_cast<std::chrono::milliseconds>(
+        stopDeadline_.value() - now);
+  } else {
+    serverRequestRegistry_->cancelAll();
+  }
+
+  if (taskPool_) {
+    taskPoolStopThread_ = std::thread([&]() {
+      taskPool_->stop();
+      loop_->queueInLoop([&]() { onTaskPoolStopped(); });
+    });
+  } else {
+    onTaskPoolStopped();
+  }
+
+  server_->stop(gracePeriod);
 }

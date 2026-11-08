@@ -14,7 +14,8 @@
 #include "TaskThreadPool.h"
 #include "TcpServer.h"
 
-class CancellationRegistry;
+class ServerRequestRegistry;
+class ReplyDispatcher;
 
 class RpcCancellationToken {
 public:
@@ -26,7 +27,7 @@ private:
   std::shared_ptr<std::atomic<bool>> canceled_;
 
   friend class RpcServer;
-  friend class CancellationRegistry;
+  friend class ServerRequestRegistry;
 };
 
 class RpcServer {
@@ -120,11 +121,23 @@ private:
 
   void tryCompleteStop();
 
+  /**
+   * 队列中无request
+   */
+  void onRequestsDrained();
+
+  /**
+   * 调用TaskPool和TcpServer关闭
+   */
+  void beginClosing();
+
 private:
-  enum class Status { kNotStarted, kRunning, kStopping, kStopped };
+  enum class Status { kNotStarted, kRunning, kDraining, kStopping, kStopped };
 
   std::shared_ptr<std::optional<size_t>> maxMessageSize_;
   EventLoop *loop_;
+  std::optional<std::chrono::steady_clock::time_point> stopDeadline_;
+  std::optional<TimerId> stopTaskId;
   Status status_;
   bool tcpServerStopped_;
   bool taskPoolStopped_;
@@ -140,7 +153,10 @@ private:
                      std::unordered_map<std::string, RpcAsyncHandler>>
       asyncHandlers_;
 
-  std::shared_ptr<CancellationRegistry> cancellationRegistry_;
+  std::shared_ptr<ServerRequestRegistry> serverRequestRegistry_;
+  std::shared_ptr<ReplyDispatcher> replyDispatcher_;
+
+  std::shared_ptr<std::function<void()>> drainedFunctor_;
 
   StopCompleteCallback stopCompleteCallback_;
 };

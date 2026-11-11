@@ -22,6 +22,15 @@ enum class RegistrationStatus {
   kConnectionLimitReached
 };
 
+enum class ExpirationResult {
+  // 记录已移除，或同一 ID 已属于另一次请求
+  kIgnored,
+  // 本次请求成功超时
+  kExpired,
+  // 本次请求成功超时，且停止中的登记表刚好清空
+  kExpiredAndDrained
+};
+
 // 一次登记对应一个对象。
 // 同步请求的 cancellation 为 std::nullopt。
 struct RequestRecord {
@@ -38,10 +47,14 @@ struct RegistrationResult {
   RequestRecordPtr record; // 登记失败时为空
 };
 
-class ServerRequestRegistry {
+class ServerRequestRegistry
+    : public std::enable_shared_from_this<ServerRequestRegistry> {
   friend class RpcServer;
 
 public:
+  explicit ServerRequestRegistry(
+      std::shared_ptr<std::function<void()>> drainedFunc);
+
   RegistrationResult tryRegister(const TcpConnectionPtr &conn,
                                  uint64_t requestId, RequestKind kind);
 
@@ -71,14 +84,29 @@ public:
   // 同时确保不再接受新登记。
   void cancelAll();
 
+  ExpirationResult expire(const TcpConnectionPtr &conn, uint64_t requestId,
+                          const RequestRecordPtr &expectedRecord);
+
+  void setAsyncHandlerTimeout(std::chrono::milliseconds timeout);
+
+  void setMaxMessageSize(size_t maxMessageSize);
+
 private:
+  struct RequestEntry {
+    RequestRecordPtr record;
+    std::optional<TimerId> timerId;
+  };
+
   struct ConnectionRequests {
-    std::unordered_map<uint64_t, RequestRecordPtr> records;
+    std::unordered_map<uint64_t, RequestEntry> entrys;
     size_t activeAsyncRequests = 0;
   };
 
   std::mutex mutex_;
   bool acceptingRequests_ = true;
+
+  std::optional<std::chrono::milliseconds> asyncTimeout;
+  std::optional<size_t> maxMessageSize_;
 
   // 保留现有“活动异步请求上限”的含义。
   size_t activeAsyncRequests_ = 0;
@@ -87,264 +115,9 @@ private:
 
   std::unordered_map<TcpConnectionPtr, ConnectionRequests>
       requestsByConnection_;
+
+  std::shared_ptr<std::function<void()>> drainedFunc_;
 };
-
-RegistrationResult
-ServerRequestRegistry::tryRegister(const TcpConnectionPtr &conn,
-                                   uint64_t requestId, RequestKind kind) {
-  assert(conn);
-  assert(kind == RequestKind::kSync || kind == RequestKind::kAsync);
-
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  auto connIt = requestsByConnection_.find(conn);
-
-  // 优先识别尚未结束的重复请求。
-  if (connIt != requestsByConnection_.end() &&
-      connIt->second.records.find(requestId) != connIt->second.records.end()) {
-    return {RegistrationStatus::kDuplicateRequestId, nullptr};
-  }
-
-  if (!acceptingRequests_) {
-    return {RegistrationStatus::kNotAccepting, nullptr};
-  }
-
-  // 现有上限只约束异步请求。
-  if (kind == RequestKind::kAsync) {
-    if (maxActiveAsyncRequests_.has_value() &&
-        activeAsyncRequests_ >= *maxActiveAsyncRequests_) {
-      return {RegistrationStatus::kGlobalLimitReached, nullptr};
-    }
-
-    const size_t connectionAsyncRequests =
-        connIt == requestsByConnection_.end()
-            ? 0
-            : connIt->second.activeAsyncRequests;
-
-    if (maxActiveAsyncRequestsPerConnection_.has_value() &&
-        connectionAsyncRequests >= *maxActiveAsyncRequestsPerConnection_) {
-      return {RegistrationStatus::kConnectionLimitReached, nullptr};
-    }
-  }
-
-  std::optional<RpcCancellationToken> cancellation;
-
-  if (kind == RequestKind::kAsync) {
-    cancellation =
-        RpcCancellationToken(std::make_shared<std::atomic<bool>>(false));
-  }
-
-  auto record = std::make_shared<const RequestRecord>(
-      RequestRecord{kind, std::move(cancellation)});
-
-  if (connIt == requestsByConnection_.end()) {
-    // 先在局部准备好记录，再把连接项放入总表。
-    ConnectionRequests connectionRequests;
-    connectionRequests.records.emplace(requestId, record);
-
-    connIt = requestsByConnection_.emplace(conn, std::move(connectionRequests))
-                 .first;
-  } else {
-    connIt->second.records.emplace(requestId, record);
-  }
-
-  // 插入成功后才更新计数。
-  if (kind == RequestKind::kAsync) {
-    ++connIt->second.activeAsyncRequests;
-    ++activeAsyncRequests_;
-  }
-
-  return {RegistrationStatus::kRegistered, std::move(record)};
-}
-
-bool ServerRequestRegistry::contains(const TcpConnectionPtr &conn,
-                                     uint64_t requestId,
-                                     const RequestRecordPtr &expected) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  auto connIt = requestsByConnection_.find(conn);
-  if (connIt == requestsByConnection_.end()) {
-    return false;
-  }
-
-  const auto &records = connIt->second.records;
-  auto requestIt = records.find(requestId);
-
-  return requestIt != records.end() && requestIt->second == expected;
-}
-
-bool ServerRequestRegistry::finish(const TcpConnectionPtr &conn,
-                                   uint64_t requestId,
-                                   const RequestRecordPtr &expected) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  auto connIt = requestsByConnection_.find(conn);
-  if (connIt == requestsByConnection_.end()) {
-    return false;
-  }
-
-  auto &connectionRequests = connIt->second;
-  auto requestIt = connectionRequests.records.find(requestId);
-
-  if (requestIt == connectionRequests.records.end()) {
-    return false;
-  }
-
-  // ID 相同还不够，必须是当初登记的同一份记录。
-  if (requestIt->second != expected) {
-    return false;
-  }
-
-  if (requestIt->second->kind == RequestKind::kAsync) {
-    --connectionRequests.activeAsyncRequests;
-    --activeAsyncRequests_;
-  }
-
-  connectionRequests.records.erase(requestIt);
-
-  if (connectionRequests.records.empty()) {
-    requestsByConnection_.erase(connIt);
-  }
-
-  return !acceptingRequests_ && requestsByConnection_.empty();
-}
-
-bool ServerRequestRegistry::cancel(const TcpConnectionPtr &conn,
-                                   uint64_t requestId) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  auto connIt = requestsByConnection_.find(conn);
-  if (connIt == requestsByConnection_.end()) {
-    return false;
-  }
-
-  auto &connectionRequests = connIt->second;
-  auto requestIt = connectionRequests.records.find(requestId);
-
-  if (requestIt == connectionRequests.records.end()) {
-    return false;
-  }
-
-  const auto &record = requestIt->second;
-
-  // 当前只支持取消异步请求。
-  if (record->kind != RequestKind::kAsync) {
-    return false;
-  }
-
-  assert(record->cancellation.has_value());
-
-  // 先通知业务任务：该请求已经被取消。
-  record->cancellation->canceled_->store(true);
-
-  --connectionRequests.activeAsyncRequests;
-  --activeAsyncRequests_;
-
-  connectionRequests.records.erase(requestIt);
-
-  if (connectionRequests.records.empty()) {
-    requestsByConnection_.erase(connIt);
-  }
-
-  return !acceptingRequests_ && requestsByConnection_.empty();
-}
-
-bool ServerRequestRegistry::stopAccepting() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  acceptingRequests_ = false;
-
-  return requestsByConnection_.empty();
-}
-
-bool ServerRequestRegistry::clearConnection(const TcpConnectionPtr &conn) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  auto connIt = requestsByConnection_.find(conn);
-  if (connIt == requestsByConnection_.end()) {
-    return false;
-  }
-
-  const auto &connectionRequests = connIt->second;
-  for (const auto &entry : connectionRequests.records) {
-    const auto &record = entry.second;
-
-    if (record->cancellation.has_value()) {
-      record->cancellation->canceled_->store(true);
-    }
-  }
-
-  assert(activeAsyncRequests_ >= connectionRequests.activeAsyncRequests);
-
-  activeAsyncRequests_ -= connectionRequests.activeAsyncRequests;
-  requestsByConnection_.erase(connIt);
-
-  return !acceptingRequests_ && requestsByConnection_.empty();
-}
-
-void ServerRequestRegistry::cancelAll() {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  acceptingRequests_ = false;
-
-  for (const auto &connectionEntry : requestsByConnection_) {
-    const auto &connectionRequests = connectionEntry.second;
-    for (const auto &entry : connectionRequests.records) {
-      const auto &record = entry.second;
-
-      if (record->cancellation.has_value()) {
-        record->cancellation->canceled_->store(true);
-      }
-    }
-  }
-
-  requestsByConnection_.clear();
-  activeAsyncRequests_ = 0;
-}
-
-class ReplyDispatcher {
-public:
-  explicit ReplyDispatcher();
-
-  bool tryQueue(const TcpConnectionPtr &conn, EventLoop::Functor functor);
-
-  bool tryQueue(EventLoop *loop, EventLoop::Functor functor);
-
-  void close();
-
-private:
-  std::mutex mutex_;
-  bool running_;
-};
-
-ReplyDispatcher::ReplyDispatcher() : running_(true) {}
-
-bool ReplyDispatcher::tryQueue(const TcpConnectionPtr &conn,
-                               EventLoop::Functor functor) {
-  std::lock_guard<std::mutex> locker(mutex_);
-
-  if (!running_) {
-    return false;
-  }
-
-  conn->loop()->queueInLoop(std::move(functor));
-  return true;
-}
-
-bool ReplyDispatcher::tryQueue(EventLoop *loop, EventLoop::Functor functor) {
-  std::lock_guard<std::mutex> locker(mutex_);
-
-  if (!running_) {
-    return false;
-  }
-
-  loop->queueInLoop(std::move(functor));
-  return true;
-}
-
-void ReplyDispatcher::close() {
-  std::lock_guard<std::mutex> locker(mutex_);
-  running_ = false;
-}
 
 namespace {
 void sendFramedData(const TcpConnectionPtr &conn, uint64_t requestId,
@@ -413,6 +186,373 @@ bool completeRequestInLoop(
 }
 } // namespace
 
+ServerRequestRegistry::ServerRequestRegistry(
+    std::shared_ptr<std::function<void()>> drainedFunc)
+    : drainedFunc_(drainedFunc) {}
+
+RegistrationResult
+ServerRequestRegistry::tryRegister(const TcpConnectionPtr &conn,
+                                   uint64_t requestId, RequestKind kind) {
+  assert(conn);
+  assert(kind == RequestKind::kSync || kind == RequestKind::kAsync);
+
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+
+  // 优先识别尚未结束的重复请求。
+  if (connIt != requestsByConnection_.end() &&
+      connIt->second.entrys.find(requestId) != connIt->second.entrys.end()) {
+    return {RegistrationStatus::kDuplicateRequestId, nullptr};
+  }
+
+  if (!acceptingRequests_) {
+    return {RegistrationStatus::kNotAccepting, nullptr};
+  }
+
+  // 现有上限只约束异步请求。
+  if (kind == RequestKind::kAsync) {
+    if (maxActiveAsyncRequests_.has_value() &&
+        activeAsyncRequests_ >= *maxActiveAsyncRequests_) {
+      return {RegistrationStatus::kGlobalLimitReached, nullptr};
+    }
+
+    const size_t connectionAsyncRequests =
+        connIt == requestsByConnection_.end()
+            ? 0
+            : connIt->second.activeAsyncRequests;
+
+    if (maxActiveAsyncRequestsPerConnection_.has_value() &&
+        connectionAsyncRequests >= *maxActiveAsyncRequestsPerConnection_) {
+      return {RegistrationStatus::kConnectionLimitReached, nullptr};
+    }
+  }
+
+  std::optional<RpcCancellationToken> cancellation;
+  std::optional<TimerId> timerId;
+
+  if (kind == RequestKind::kAsync) {
+    cancellation =
+        RpcCancellationToken(std::make_shared<std::atomic<bool>>(false));
+  }
+
+  auto record = std::make_shared<const RequestRecord>(
+      RequestRecord{kind, std::move(cancellation)});
+
+  if (kind == RequestKind::kAsync && asyncTimeout.has_value()) {
+    std::weak_ptr<TcpConnection> weakConnPtr = conn;
+    std::weak_ptr<ServerRequestRegistry> weakServerRegistryPtr =
+        shared_from_this();
+    std::weak_ptr<const RequestRecord> weakRecordPtr = record;
+
+    timerId = conn->loop()->runAfter(
+        asyncTimeout.value(),
+        [weakConnPtr, weakServerRegistryPtr, weakRecordPtr, requestId,
+         maxMessageSize = maxMessageSize_, sendResponse = sendFramedData,
+         drainedFunc = drainedFunc_]() {
+          auto conn = weakConnPtr.lock();
+          auto serverRegistry = weakServerRegistryPtr.lock();
+          auto record = weakRecordPtr.lock();
+
+          if (!conn || !serverRegistry || !record) {
+            return;
+          }
+
+          ExpirationResult result =
+              serverRegistry->expire(conn, requestId, record);
+          if (result == ExpirationResult::kIgnored) {
+            return;
+          }
+
+          sendResponse(
+              conn, requestId, ResponseResult::kUnsuccess,
+              RpcErrorCode::REQUEST_TIMEOUT, "", "handler running timeout",
+              maxMessageSize.value_or(LengthHeaderCodec::kMaxMessageSize));
+
+          if (result == ExpirationResult::kExpiredAndDrained) {
+            (*drainedFunc)();
+          }
+        });
+  }
+
+  if (connIt == requestsByConnection_.end()) {
+    // 先在局部准备好记录，再把连接项放入总表。
+    ConnectionRequests connectionRequests;
+    RequestEntry entry{record, timerId};
+    connectionRequests.entrys.emplace(requestId, RequestEntry{record, timerId});
+
+    connIt = requestsByConnection_.emplace(conn, std::move(connectionRequests))
+                 .first;
+  } else {
+    connIt->second.entrys.emplace(requestId, RequestEntry{record, timerId});
+  }
+
+  // 插入成功后才更新计数。
+  if (kind == RequestKind::kAsync) {
+    ++connIt->second.activeAsyncRequests;
+    ++activeAsyncRequests_;
+  }
+
+  return {RegistrationStatus::kRegistered, std::move(record)};
+}
+
+bool ServerRequestRegistry::contains(const TcpConnectionPtr &conn,
+                                     uint64_t requestId,
+                                     const RequestRecordPtr &expected) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+  if (connIt == requestsByConnection_.end()) {
+    return false;
+  }
+
+  const auto &records = connIt->second.entrys;
+  auto requestIt = records.find(requestId);
+
+  return requestIt != records.end() && requestIt->second.record == expected;
+}
+
+bool ServerRequestRegistry::finish(const TcpConnectionPtr &conn,
+                                   uint64_t requestId,
+                                   const RequestRecordPtr &expected) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+  if (connIt == requestsByConnection_.end()) {
+    return false;
+  }
+
+  auto &connectionRequests = connIt->second;
+  auto requestIt = connectionRequests.entrys.find(requestId);
+
+  if (requestIt == connectionRequests.entrys.end()) {
+    return false;
+  }
+
+  // ID 相同还不够，必须是当初登记的同一份记录。
+  if (requestIt->second.record != expected) {
+    return false;
+  }
+
+  auto entry = requestIt->second;
+  if (entry.record->kind == RequestKind::kAsync) {
+    --connectionRequests.activeAsyncRequests;
+    --activeAsyncRequests_;
+
+    if (entry.timerId.has_value()) {
+      conn->loop()->cancel(entry.timerId.value());
+    }
+  }
+
+  connectionRequests.entrys.erase(requestIt);
+
+  if (connectionRequests.entrys.empty()) {
+    requestsByConnection_.erase(connIt);
+  }
+
+  return !acceptingRequests_ && requestsByConnection_.empty();
+}
+
+bool ServerRequestRegistry::cancel(const TcpConnectionPtr &conn,
+                                   uint64_t requestId) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+  if (connIt == requestsByConnection_.end()) {
+    return false;
+  }
+
+  auto &connectionRequests = connIt->second;
+  auto requestIt = connectionRequests.entrys.find(requestId);
+
+  if (requestIt == connectionRequests.entrys.end()) {
+    return false;
+  }
+
+  const auto &record = requestIt->second.record;
+
+  // 当前只支持取消异步请求。
+  if (record->kind != RequestKind::kAsync) {
+    return false;
+  }
+
+  auto entry = requestIt->second;
+  assert(entry.record->cancellation.has_value());
+
+  // 先通知业务任务：该请求已经被取消。
+  record->cancellation->canceled_->store(true);
+
+  --connectionRequests.activeAsyncRequests;
+  --activeAsyncRequests_;
+
+  if (entry.timerId.has_value()) {
+    conn->loop()->cancel(entry.timerId.value());
+  }
+
+  connectionRequests.entrys.erase(requestIt);
+
+  if (connectionRequests.entrys.empty()) {
+    requestsByConnection_.erase(connIt);
+  }
+
+  return !acceptingRequests_ && requestsByConnection_.empty();
+}
+
+bool ServerRequestRegistry::stopAccepting() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  acceptingRequests_ = false;
+
+  return requestsByConnection_.empty();
+}
+
+bool ServerRequestRegistry::clearConnection(const TcpConnectionPtr &conn) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  auto connIt = requestsByConnection_.find(conn);
+  if (connIt == requestsByConnection_.end()) {
+    return false;
+  }
+
+  const auto &connectionRequests = connIt->second;
+  for (const auto &entry : connectionRequests.entrys) {
+    const auto &record = entry.second.record;
+
+    if (record->cancellation.has_value()) {
+      record->cancellation->canceled_->store(true);
+    }
+
+    if (entry.second.timerId.has_value()) {
+      conn->loop()->cancel(entry.second.timerId.value());
+    }
+  }
+
+  assert(activeAsyncRequests_ >= connectionRequests.activeAsyncRequests);
+
+  activeAsyncRequests_ -= connectionRequests.activeAsyncRequests;
+  requestsByConnection_.erase(connIt);
+
+  return !acceptingRequests_ && requestsByConnection_.empty();
+}
+
+void ServerRequestRegistry::cancelAll() {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  acceptingRequests_ = false;
+
+  for (const auto &connectionEntry : requestsByConnection_) {
+    const auto &connectionRequests = connectionEntry.second;
+    for (const auto &entry : connectionRequests.entrys) {
+      const auto &record = entry.second.record;
+
+      if (record->cancellation.has_value()) {
+        record->cancellation->canceled_->store(true);
+      }
+
+      if (entry.second.timerId.has_value()) {
+        connectionEntry.first->loop()->cancel(entry.second.timerId.value());
+      }
+    }
+  }
+
+  requestsByConnection_.clear();
+  activeAsyncRequests_ = 0;
+}
+
+ExpirationResult
+ServerRequestRegistry::expire(const TcpConnectionPtr &conn, uint64_t requestId,
+                              const RequestRecordPtr &expectedRecord) {
+  std::lock_guard<std::mutex> locker(mutex_);
+
+  auto connItr = requestsByConnection_.find(conn);
+  if (connItr == requestsByConnection_.end()) {
+    return ExpirationResult::kIgnored;
+  }
+
+  auto &entrys = connItr->second.entrys;
+  auto recordItr = entrys.find(requestId);
+  if (recordItr == entrys.end()) {
+    return ExpirationResult::kIgnored;
+  }
+
+  auto record = recordItr->second.record;
+  if (record->kind == RequestKind::kSync) {
+    return ExpirationResult::kIgnored;
+  }
+
+  if (record != expectedRecord) {
+    return ExpirationResult::kIgnored;
+  }
+
+  record->cancellation->canceled_->store(true);
+  entrys.erase(recordItr);
+  --connItr->second.activeAsyncRequests;
+  --activeAsyncRequests_;
+
+  if (entrys.empty()) {
+    requestsByConnection_.erase(connItr);
+  }
+
+  if (!acceptingRequests_ && requestsByConnection_.empty()) {
+    return ExpirationResult::kExpiredAndDrained;
+  }
+
+  return ExpirationResult::kExpired;
+}
+
+void ServerRequestRegistry::setAsyncHandlerTimeout(
+    std::chrono::milliseconds timeout) {
+  asyncTimeout = timeout;
+}
+
+void ServerRequestRegistry::setMaxMessageSize(size_t maxMessageSize) {
+  maxMessageSize_ = maxMessageSize;
+}
+
+class ReplyDispatcher {
+public:
+  explicit ReplyDispatcher();
+
+  bool tryQueue(const TcpConnectionPtr &conn, EventLoop::Functor functor);
+
+  bool tryQueue(EventLoop *loop, EventLoop::Functor functor);
+
+  void close();
+
+private:
+  std::mutex mutex_;
+  bool running_;
+};
+
+ReplyDispatcher::ReplyDispatcher() : running_(true) {}
+
+bool ReplyDispatcher::tryQueue(const TcpConnectionPtr &conn,
+                               EventLoop::Functor functor) {
+  std::lock_guard<std::mutex> locker(mutex_);
+
+  if (!running_) {
+    return false;
+  }
+
+  conn->loop()->queueInLoop(std::move(functor));
+  return true;
+}
+
+bool ReplyDispatcher::tryQueue(EventLoop *loop, EventLoop::Functor functor) {
+  std::lock_guard<std::mutex> locker(mutex_);
+
+  if (!running_) {
+    return false;
+  }
+
+  loop->queueInLoop(std::move(functor));
+  return true;
+}
+
+void ReplyDispatcher::close() {
+  std::lock_guard<std::mutex> locker(mutex_);
+  running_ = false;
+}
+
 RpcServer::RpcServer(EventLoop *loop, int listenFd, int threadNum)
     : loop_(loop), status_(Status::kNotStarted), tcpServerStopped_(false),
       taskPoolStopped_(false) {
@@ -423,10 +563,32 @@ RpcServer::RpcServer(EventLoop *loop, int listenFd, int threadNum)
 
   maxMessageSize_ = std::make_shared<std::optional<size_t>>();
   server_ = std::make_unique<TcpServer>(loop, listenFd, threadNum);
-  serverRequestRegistry_ = std::make_shared<ServerRequestRegistry>();
   replyDispatcher_ = std::make_shared<ReplyDispatcher>();
+
   drainedFunctor_ =
       std::make_shared<std::function<void()>>([this] { onRequestsDrained(); });
+
+  std::weak_ptr<ReplyDispatcher> weakReplyDispatcherPtr = replyDispatcher_;
+  std::weak_ptr<std::function<void()>> drainedFunctorPtr = drainedFunctor_;
+  std::shared_ptr<std::function<void()>> drainedFunc =
+      std::make_shared<std::function<void()>>(
+          [weakReplyDispatcherPtr, baseLoop = loop_, drainedFunctorPtr]() {
+            auto replyDispatcher = weakReplyDispatcherPtr.lock();
+            if (!replyDispatcher) {
+              return;
+            }
+
+            replyDispatcher->tryQueue(baseLoop, [drainedFunctorPtr]() {
+              auto drainedFunctor = drainedFunctorPtr.lock();
+              if (!drainedFunctor) {
+                return;
+              }
+
+              (*drainedFunctor)();
+            });
+          });
+
+  serverRequestRegistry_ = std::make_shared<ServerRequestRegistry>(drainedFunc);
 
   lengthHeaderCodec_.setMessageCallback(std::bind(&RpcServer::onRpcMessage,
                                                   this, std::placeholders::_1,
@@ -633,6 +795,8 @@ void RpcServer::setMaxMessageSize(size_t maxMessageSize) {
   assert(maxMessageSize <= LengthHeaderCodec::kMaxMessageSize);
 
   *maxMessageSize_ = maxMessageSize;
+
+  serverRequestRegistry_->setMaxMessageSize(maxMessageSize);
 }
 
 void RpcServer::setWorkerThreadNum(uint8_t workThreadNum) {
@@ -651,6 +815,14 @@ void RpcServer::setMaxWorkerQueue(size_t maxWorkerQueue) {
   assert(taskPool_);
 
   taskPool_->setMaxQueueTasks(maxWorkerQueue);
+}
+
+void RpcServer::setAsyncHandlerTimeout(std::chrono::milliseconds timeout) {
+  loop_->assertInLoopThread();
+  assert(status_ == Status::kNotStarted);
+  assert(timeout > std::chrono::milliseconds(0));
+
+  serverRequestRegistry_->setAsyncHandlerTimeout(timeout);
 }
 
 void RpcServer::onRpcMessage(const TcpConnectionPtr &conn,

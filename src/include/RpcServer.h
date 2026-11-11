@@ -94,6 +94,8 @@ public:
 
   void setMaxWorkerQueue(size_t maxWorkerQueue);
 
+  void setAsyncHandlerTimeout(std::chrono::milliseconds timeout);
+
 private:
   void onRpcMessage(const TcpConnectionPtr &, const std::string &);
 
@@ -155,7 +157,6 @@ private:
 
   std::shared_ptr<ServerRequestRegistry> serverRequestRegistry_;
   std::shared_ptr<ReplyDispatcher> replyDispatcher_;
-
   std::shared_ptr<std::function<void()>> drainedFunctor_;
 
   StopCompleteCallback stopCompleteCallback_;

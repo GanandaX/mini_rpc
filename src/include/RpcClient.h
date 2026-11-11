@@ -19,6 +19,13 @@
 
 using RpcCallback = std::function<void(const RpcResponse &)>;
 
+struct RpcCallOptions {
+  std::optional<std::chrono::milliseconds> timeout;
+  std::optional<bool> allowResend;
+  std::optional<std::chrono::milliseconds> reconnectTimeout;
+  std::optional<uint8_t> resendLimit;
+};
+
 class RpcClient {
 public:
   explicit RpcClient(EventLoop *loop, const InetAddress &serverAddr);
@@ -46,6 +53,10 @@ public:
       std::chrono::milliseconds timeout, bool allowReconnect,
       std::chrono::milliseconds reconnectTimeout = std::chrono::milliseconds(0),
       std::optional<uint8_t> resendLimit = std::nullopt);
+
+  uint64_t call(const std::string &service, const std::string &method,
+                const std::string &payload, RpcCallback cb,
+                RpcCallOptions callOptions);
 
   void enableRetry();
   void disableRetry();
@@ -81,7 +92,8 @@ private:
   void onRpcMessage(const TcpConnectionPtr &conn, const std::string &msg);
   void onConnectionError(int errorCode);
   void failAllPendingRequests(RpcErrorCode errorCode, std::string errorMessage);
-  void failAllDisreconnectRequests(RpcErrorCode errorCode, std::string errorMessage);
+  void failAllDisreconnectRequests(RpcErrorCode errorCode,
+                                   std::string errorMessage);
   void onRequestTimeout(uint64_t requestId);
   void onReconnectTimeout(uint64_t requestId);
 

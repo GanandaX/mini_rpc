@@ -1,4 +1,5 @@
 # mini_rpc
+
 ```txt
 基于 mini_muduo 实现的第一版 C++ RPC。
 构建前，请将 mini_rpc 和 mini_muduo 克隆到同一父目录下，并确保 mini_muduo 的本地目录名为 mini_muduo。
@@ -11,6 +12,7 @@
 - 服务端返回成功 payload 或失败 errorMessage。
 
 本版本不包含：
+
 - 复杂参数与复杂序列化；
 - 服务发现、负载均衡、注册中心；
 
@@ -22,10 +24,10 @@ cmake --build build
 
 ./build/rpc_echo_example
 ```
+
 rpc_echo_example 会在同一进程中启动 Echo 服务端和客户端，输出响应 payload 后优雅退出。
 
 ***
-
 
 rpc_echo_server_example 会启动Echo服务端，其可以通过后接端口来指定端口号或不输入等待系统自动分配。server中包含三个方法，分别为echo、async_echo 和 async_echo_2。在server启动后会打印ip和端口。在调用rpc_echo_client_example时需在后面指定server的ip和端口。client在执行完后自动退出，但server会常驻。
 
@@ -34,42 +36,50 @@ rpc_echo_server_example 会启动Echo服务端，其可以通过后接端口来�
 server: 127.0.0.1:41545            
 pid: 308728
 ```  
+
 ```txt
 第一个终端
 实际运行时会显示当前状态下的ip和端口 
 ```  
-<br>
 
+<br>
 
 ```bash
 ./build/rpc_echo_client_example 127.0.0.1 41545
 ```
+
 ```txt
 第二个终端
 实际运行时要用服务端打印的端口
 ```
+
 <br>
 
 `指定端口`
+
 ```bash
 ./build/rpc_echo_server_example 1122
 server: 127.0.0.1:1122
 pid: 311062
 ```  
+
 ```txt
 第一个终端 
-```   
+```
+
 <br>
 
 ```bash
 ./build/rpc_echo_client_example 127.0.0.1 1122
 ```
+
 ```txt
 第二个终端
-```   
+```
 
 ## 基本用法
-### 服务端：
+
+### 服务端
 
 ``` C++
 // 为server设置工作线程数
@@ -81,6 +91,7 @@ RpcServer server(&loop, serverFd);
 server.setWorkerThreadNum(4);
 
 ```
+
 <br>
 
 ``` C++
@@ -92,6 +103,7 @@ server.setWorkerThreadNum(1);
 server.setMaxWorkerQueue(1);
 
 ```
+
 <br>
 
 ``` C++
@@ -103,6 +115,7 @@ server.setMaxWorkerQueue(1);
 // start() 前、base EventLoop 线程调用
 setMaxMessageSize(size_t);
 ```
+
 <br>
 
 ``` C++
@@ -115,6 +128,7 @@ setMaxActiveRequests(size_t)：
 // 单条 TCP 连接的活动异步请求上限；
 setMaxActiveRequestsPerConnection(size_t)：
 ```
+
 <br>
 
 ``` C++
@@ -133,6 +147,7 @@ bool registered = server.registerAsyncMethod(
 
 server.start();
 ```
+
 <br>
 
 ``` C++
@@ -146,8 +161,8 @@ bool registered = server.registerMethod(
 
 server.start();
 ```
-<br>
 
+<br>
 
 ``` C++
 RpcServer server(&loop, serverFd);
@@ -157,10 +172,10 @@ RpcServer server(&loop, serverFd);
 bool unregistered =
     server.unregisterMethod("EchoService", "Echo");
 ```
+
 <br>
 
-
-### 客户端：
+### 客户端
 
 ``` C++
 // 设置消息收发的最大字节数(整个rpc消息的所有字节数,不包括LengthHeaderCodec 附加的 4 字节长度头),可配置长度[1, 64MiB]。
@@ -170,6 +185,7 @@ bool unregistered =
 // 首次 connect() 前、所属 EventLoop 线程调用
 setMaxMessageSize(size_t);
 ```
+
 <br>
 
 ```txt
@@ -226,6 +242,19 @@ setMaxMessageSize(size_t);
             std::chrono::milliseconds(1000), true, std::chrono::milliseconds(500),
             2);
 
+    // 通过call配置自动重发，默认次数为 5，本次指定 2，使用本次配置，开启重连后重发，重发超时时间沿用客户端默认值
+    RpcClient client(&loop, serverAddr);
+    client.enableRetry();
+    client.setDefaultResendLimit(5);
+
+    RpcCallOptions options;
+    options.allowResend = true;
+    options.resendLimit = 2;
+    client.call("EchoService", "Echo", "hello world",
+          [&](const RpcResponse &response) {
+                ...
+            }, options);   
+
 
 
     // 通过call配置自动重发，设置重连后重发次数为0次，即关闭重发，即使全局配置重发次数为3，此次request也不开启重发
@@ -240,6 +269,7 @@ setMaxMessageSize(size_t);
         std::chrono::milliseconds(1000), true, std::chrono::milliseconds(500),
         0);
 ```
+
 <br>
 
 ``` C++
@@ -252,6 +282,7 @@ client.call(
       // 读取 payload 或 errorMessage
     });
 ```
+
 <br>
 
 ``` C++
@@ -270,8 +301,8 @@ client.call(
     },
     std::chrono::milliseconds(0));
 ```
-<br>
 
+<br>
 
 ``` C++
 // 该方法用于取消对应请求的调用，若请求仍在等待响应，调用其原 callback 并返回失败响应；找不到 requestId 时静默返回。本地回调 "rpc request canceled"，请求在等待响应或等待重连时都可以取消；只有连接仍可用时才发送 Cancel 帧
@@ -283,20 +314,22 @@ uint64_t requestId = client.call("EchoService", "Echo", "hello world",
 client.cancel(requestId);
 ```
 
-
 ``` C++
 // 该方法用于设置默认过期时间,只能在客户端所属 EventLoop 调用,只能在首次 connect() 前调用。
 client.setDefaultTimeout(std::chrono::milliseconds(100));
 ```
+
 <br>
 
 ``` C++
 // 该方法用于当前RpcClient同时最大的请求承载量，若当前Client的pending 请求数达到上限时直接返回调用错误的回调。默认不限制RpcClient的同时最大请求量。只能在客户端所属 EventLoop 调用,只能在首次 connect() 前调用。
 client.setMaxPendingRequests(1);
 ```
+
 <br>
 
 ### 通过 `CalculatorClient::add` 交互
+
 ``` C++
 // 在连接成功后调用 add()；封装负责参数编码和结果解码，回调通过 status 判断成功或失败，成功读取 value，失败读取 errorMessage。
 // CalculatorClient 通过 AddResult.errorCode 暴露错误码
@@ -324,13 +357,13 @@ client.add(1, 2, [&](AddResult result) {
     std::chrono::milliseconds(0));
 ```
 
-
 ## 协议
+
 每条 RPC 消息先由 LengthHeaderCodec 分帧；它只处理消息边界，
 不理解 RPC 请求或响应的字段含义。
 
 |Message|Fields|
-| :---: | :---: |
+|:---:|:---:|
 |Request|version, messageType, requestId, service, method, payload|
 |Response|version, messageType, requestId, result, errorCode, payload, errorMessage|
 |Cancel|version, messageType,requestId|
@@ -346,8 +379,8 @@ client.add(1, 2, [&](AddResult result) {
 - 收到不支持的 `version`、非法 `messageType`，或不符合端点方向的消息类型时，连接会被关闭。
 - 服务端只接收 `Request` 和 `Cancel`；客户端只接收 `Response`。
 
-
 ## 对象所属关系和线程
+
 - `EventLoop` 由调用方拥有；
 - `RpcServer` 拥有 `TcpServer` 和服务端 codec；
 - `RpcClient` 拥有 `TcpClient` 和客户端 codec；
@@ -357,6 +390,7 @@ client.add(1, 2, [&](AddResult result) {
 - `cancel`支持跨线程调用，但对应的回调函数仍在 `RpcClient` 所在的 `EventLoop` 中执行。
 
 ## 请求生命周期
+
 - `timeout == 0ms` 表示永不超时；
 - 超时 callback 收到失败响应；
 - 迟到响应会被忽略；

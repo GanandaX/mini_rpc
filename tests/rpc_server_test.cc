@@ -8199,6 +8199,12 @@ void rpc_client_uses_per_call_resend_limit_over_default_test() {
         return;
       }
 
+      struct RpcCallOptions options;
+      options.allowResend = true;
+      options.timeout = std::chrono::milliseconds(1000);
+      options.reconnectTimeout = std::chrono::milliseconds(500);
+      options.resendLimit = 2;
+
       client.call(
           "EchoService", "Echo", "hello world",
           [&](const RpcResponse &response) {
@@ -8208,8 +8214,7 @@ void rpc_client_uses_per_call_resend_limit_over_default_test() {
             ++unsuccessRequestCallbackCount;
             client.disconnect();
           },
-          std::chrono::milliseconds(1000), true, std::chrono::milliseconds(500),
-          2);
+          options);
     } else {
       ++clientDisconnected;
 

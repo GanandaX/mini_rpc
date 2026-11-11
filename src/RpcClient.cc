@@ -98,7 +98,7 @@ uint64_t RpcClient::call(const std::string &service, const std::string &method,
 
 uint64_t RpcClient::call(const std::string &service, const std::string &method,
                          const std::string &payload, RpcCallback cb,
-                         std::chrono::milliseconds timeout, bool allowReconnect,
+                         std::chrono::milliseconds timeout, bool allowResend,
                          std::chrono::milliseconds reconnectTimeout,
                          std::optional<uint8_t> resendLimit) {
   assert(cb != nullptr);
@@ -109,16 +109,26 @@ uint64_t RpcClient::call(const std::string &service, const std::string &method,
 
   if (loop_->isInLoopThread()) {
     callInLoop(requestId, service, method, payload, std::move(cb), timeout,
-               allowReconnect, reconnectTimeout, resendLimit);
+               allowResend, reconnectTimeout, resendLimit);
   } else {
     loop_->queueInLoop([this, requestId, service, method, payload,
-                        callback = std::move(cb), timeout, allowReconnect,
+                        callback = std::move(cb), timeout, allowResend,
                         reconnectTimeout, resendLimit]() mutable {
       callInLoop(requestId, service, method, payload, std::move(callback),
-                 timeout, allowReconnect, reconnectTimeout, resendLimit);
+                 timeout, allowResend, reconnectTimeout, resendLimit);
     });
   }
   return requestId;
+}
+
+uint64_t RpcClient::call(const std::string &service, const std::string &method,
+                         const std::string &payload, RpcCallback cb,
+                         RpcCallOptions callOptions) {
+  return call(service, method, payload, std::move(cb),
+              callOptions.timeout.value_or(defaultTimeout_),
+              callOptions.allowResend.value_or(defaultAllowResend_),
+              callOptions.reconnectTimeout.value_or(defaultReconnectTimeout_),
+              callOptions.resendLimit.value_or(defaultResendLimit_));
 }
 
 void RpcClient::enableRetry() {

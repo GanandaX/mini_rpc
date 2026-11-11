@@ -1,10 +1,10 @@
 #ifndef CALCULATOR_CLIENT_H
 #define CALCULATOR_CLIENT_H
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
-#include <chrono>
 
 #include "InetAddress.h"
 #include "RpcClient.h"
@@ -27,6 +27,9 @@ public:
   uint64_t add(int32_t a, int32_t b, AddCallback callback,
                std::chrono::milliseconds timeout);
 
+  uint64_t add(int32_t a, int32_t b, AddCallback callback,
+               RpcCallOptions options);
+
   void setDefaultTimeout(std::chrono::milliseconds timeout);
 
   void cancel(uint64_t requestId);
@@ -38,6 +41,10 @@ public:
   void setConnectionErrorCallback(ConnectionErrorCallback callback);
 
   void disconnect();
+
+  void enableRetry();
+
+  void disableRetry();
 
 private:
   static RpcCallback wrapAddCallback(AddCallback callback);

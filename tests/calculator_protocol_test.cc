@@ -647,6 +647,9 @@ void calculator_client_uses_default_timeout_and_allows_zero_override_test() {
         }
       });
 
+      RpcCallOptions options;
+      options.timeout = std::chrono::milliseconds(0);
+
       client.add(
           1, 2,
           [&](AddResult result) {
@@ -659,7 +662,7 @@ void calculator_client_uses_default_timeout_and_allows_zero_override_test() {
               client.disconnect();
             }
           },
-          std::chrono::milliseconds(0));
+          options);
     } else {
       ++clientDisconnected;
       server.stop(std::chrono::milliseconds(0));

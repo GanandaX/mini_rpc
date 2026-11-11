@@ -25,6 +25,16 @@ uint64_t CalculatorClient::add(int32_t a, int32_t b, AddCallback callback,
                       wrapAddCallback(std::move(callback)), timeout);
 }
 
+uint64_t CalculatorClient::add(int32_t a, int32_t b, AddCallback callback,
+                               RpcCallOptions options) {
+  assert(callback);
+  CalculatorProtocol protocol(a, b);
+  std::string payload = protocol.requestEncode();
+
+  return client_.call("Calculator", "Add", payload,
+                      wrapAddCallback(std::move(callback)), std::move(options));
+}
+
 void CalculatorClient::setDefaultTimeout(std::chrono::milliseconds timeout) {
   client_.setDefaultTimeout(timeout);
 }
@@ -43,6 +53,10 @@ void CalculatorClient::setConnectionErrorCallback(
 }
 
 void CalculatorClient::disconnect() { client_.disconnect(); }
+
+void CalculatorClient::enableRetry() { client_.enableRetry(); }
+
+void CalculatorClient::disableRetry() { client_.disableRetry(); }
 
 RpcCallback CalculatorClient::wrapAddCallback(AddCallback callback) {
   return [addCallback = std::move(callback)](const RpcResponse &response) {

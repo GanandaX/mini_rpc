@@ -82,6 +82,11 @@ public:
                            const std::string &method,
                            RpcAsyncHandler asyncHandler);
 
+  bool registerAsyncMethod(const std::string &service,
+                           const std::string &method,
+                           RpcAsyncHandler asyncHandle,
+                           std::chrono::milliseconds timeout);
+
   bool unregisterMethod(const std::string &service, const std::string &method);
 
   void setMaxActiveRequests(size_t maxActiveRequests);
@@ -136,6 +141,11 @@ private:
 private:
   enum class Status { kNotStarted, kRunning, kDraining, kStopping, kStopped };
 
+    struct AsyncMethodEntry {
+    RpcAsyncHandler handler;
+    std::optional<std::chrono::milliseconds> timeoutOverride;
+  };
+
   std::shared_ptr<std::optional<size_t>> maxMessageSize_;
   EventLoop *loop_;
   std::optional<std::chrono::steady_clock::time_point> stopDeadline_;
@@ -152,7 +162,7 @@ private:
   std::unordered_map<std::string, std::unordered_map<std::string, RpcHandler>>
       syncHandlers_;
   std::unordered_map<std::string,
-                     std::unordered_map<std::string, RpcAsyncHandler>>
+                     std::unordered_map<std::string, AsyncMethodEntry>>
       asyncHandlers_;
 
   std::shared_ptr<ServerRequestRegistry> serverRequestRegistry_;

@@ -55,8 +55,10 @@ public:
   explicit ServerRequestRegistry(
       std::shared_ptr<std::function<void()>> drainedFunc);
 
-  RegistrationResult tryRegister(const TcpConnectionPtr &conn,
-                                 uint64_t requestId, RequestKind kind);
+  RegistrationResult
+  tryRegister(const TcpConnectionPtr &conn, uint64_t requestId,
+              RequestKind kind,
+              std::optional<std::chrono::milliseconds> timeout = std::nullopt);
 
   // 是否仍然是表中有效的那次登记。
   bool contains(const TcpConnectionPtr &conn, uint64_t requestId,
@@ -190,9 +192,9 @@ ServerRequestRegistry::ServerRequestRegistry(
     std::shared_ptr<std::function<void()>> drainedFunc)
     : drainedFunc_(drainedFunc) {}
 
-RegistrationResult
-ServerRequestRegistry::tryRegister(const TcpConnectionPtr &conn,
-                                   uint64_t requestId, RequestKind kind) {
+RegistrationResult ServerRequestRegistry::tryRegister(
+    const TcpConnectionPtr &conn, uint64_t requestId, RequestKind kind,
+    std::optional<std::chrono::milliseconds> timeout) {
   assert(conn);
   assert(kind == RequestKind::kSync || kind == RequestKind::kAsync);
 
@@ -239,14 +241,16 @@ ServerRequestRegistry::tryRegister(const TcpConnectionPtr &conn,
   auto record = std::make_shared<const RequestRecord>(
       RequestRecord{kind, std::move(cancellation)});
 
-  if (kind == RequestKind::kAsync && asyncTimeout.has_value()) {
+  const auto effectiveTimeout = timeout ? timeout : asyncTimeout;
+
+  if (kind == RequestKind::kAsync && effectiveTimeout.has_value()) {
     std::weak_ptr<TcpConnection> weakConnPtr = conn;
     std::weak_ptr<ServerRequestRegistry> weakServerRegistryPtr =
         shared_from_this();
     std::weak_ptr<const RequestRecord> weakRecordPtr = record;
 
     timerId = conn->loop()->runAfter(
-        asyncTimeout.value(),
+        effectiveTimeout.value(),
         [weakConnPtr, weakServerRegistryPtr, weakRecordPtr, requestId,
          maxMessageSize = maxMessageSize_, sendResponse = sendFramedData,
          drainedFunc = drainedFunc_]() {
@@ -705,15 +709,48 @@ bool RpcServer::registerAsyncMethod(const std::string &service,
 
   auto serviceItr = asyncHandlers_.find(service);
   if (serviceItr == asyncHandlers_.end()) {
-    std::unordered_map<std::string, RpcAsyncHandler> methodMap;
-    methodMap[method] = std::move(asyncHandler);
+    std::unordered_map<std::string, AsyncMethodEntry> methodMap;
+    methodMap[method] = {std::move(asyncHandler), std::nullopt};
     asyncHandlers_[service] = std::move(methodMap);
     return true;
   }
 
   auto handlerItr = serviceItr->second.find(method);
   if (handlerItr == serviceItr->second.end()) {
-    (serviceItr->second)[method] = std::move(asyncHandler);
+    (serviceItr->second)[method] = {std::move(asyncHandler), std::nullopt};
+    return true;
+  }
+
+  return false;
+}
+
+bool RpcServer::registerAsyncMethod(const std::string &service,
+                                    const std::string &method,
+                                    RpcAsyncHandler asyncHandler,
+                                    std::chrono::milliseconds timeout) {
+  loop_->assertInLoopThread();
+  assert(status_ == Status::kNotStarted);
+  assert(timeout > std::chrono::milliseconds(0));
+
+  if (service.empty() || method.empty() || !asyncHandler) {
+    return false;
+  }
+
+  if (isRegistered(service, method)) {
+    return false;
+  }
+
+  auto serviceItr = asyncHandlers_.find(service);
+  if (serviceItr == asyncHandlers_.end()) {
+    std::unordered_map<std::string, AsyncMethodEntry> methodMap;
+    methodMap[method] = {std::move(asyncHandler), timeout};
+    asyncHandlers_[service] = std::move(methodMap);
+    return true;
+  }
+
+  auto handlerItr = serviceItr->second.find(method);
+  if (handlerItr == serviceItr->second.end()) {
+    (serviceItr->second)[method] = {std::move(asyncHandler), timeout};
     return true;
   }
 
@@ -1062,13 +1099,14 @@ void RpcServer::invokeSyncHandler(const TcpConnectionPtr &conn,
 void RpcServer::invokeAsyncHandler(const TcpConnectionPtr &conn,
                                    RpcRequest request) {
   auto serviceItr = asyncHandlers_.find(request.getService());
-  auto handler = serviceItr->second.find(request.getMethod())->second;
+  auto methodEntry = serviceItr->second.find(request.getMethod())->second;
 
   std::weak_ptr<TcpConnection> connWeakPtr = conn;
   uint64_t requestId = request.getRequestId();
 
   RegistrationResult result = serverRequestRegistry_->tryRegister(
-      conn, request.getRequestId(), RequestKind::kAsync);
+      conn, request.getRequestId(), RequestKind::kAsync,
+      methodEntry.timeoutOverride);
 
   if (result.status != RegistrationStatus::kRegistered) {
     RpcErrorCode errorCode = RpcErrorCode::INTERNAL_ERROR;
@@ -1171,7 +1209,7 @@ void RpcServer::invokeAsyncHandler(const TcpConnectionPtr &conn,
         });
   };
 
-  auto functor = [request, handler, reply,
+  auto functor = [request, handler = methodEntry.handler, reply,
                   token = result.record->cancellation.value()]() {
     try {
       if (token.isCanceled()) {

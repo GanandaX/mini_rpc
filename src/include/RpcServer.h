@@ -138,10 +138,15 @@ private:
    */
   void beginClosing();
 
+  bool registerAsyncMethodImpl(
+      const std::string &service, const std::string &method,
+      RpcAsyncHandler asyncHandler,
+      std::optional<std::chrono::milliseconds> timeoutOverride);
+
 private:
   enum class Status { kNotStarted, kRunning, kDraining, kStopping, kStopped };
 
-    struct AsyncMethodEntry {
+  struct AsyncMethodEntry {
     RpcAsyncHandler handler;
     std::optional<std::chrono::milliseconds> timeoutOverride;
   };

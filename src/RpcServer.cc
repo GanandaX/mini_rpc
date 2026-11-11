@@ -696,65 +696,16 @@ bool RpcServer::registerMethod(const std::string &service,
 bool RpcServer::registerAsyncMethod(const std::string &service,
                                     const std::string &method,
                                     RpcAsyncHandler asyncHandler) {
-  loop_->assertInLoopThread();
-  assert(status_ == Status::kNotStarted);
-
-  if (service.empty() || method.empty() || !asyncHandler) {
-    return false;
-  }
-
-  if (isRegistered(service, method)) {
-    return false;
-  }
-
-  auto serviceItr = asyncHandlers_.find(service);
-  if (serviceItr == asyncHandlers_.end()) {
-    std::unordered_map<std::string, AsyncMethodEntry> methodMap;
-    methodMap[method] = {std::move(asyncHandler), std::nullopt};
-    asyncHandlers_[service] = std::move(methodMap);
-    return true;
-  }
-
-  auto handlerItr = serviceItr->second.find(method);
-  if (handlerItr == serviceItr->second.end()) {
-    (serviceItr->second)[method] = {std::move(asyncHandler), std::nullopt};
-    return true;
-  }
-
-  return false;
+  return registerAsyncMethodImpl(service, method, std::move(asyncHandler),
+                                 std::nullopt);
 }
 
 bool RpcServer::registerAsyncMethod(const std::string &service,
                                     const std::string &method,
                                     RpcAsyncHandler asyncHandler,
                                     std::chrono::milliseconds timeout) {
-  loop_->assertInLoopThread();
-  assert(status_ == Status::kNotStarted);
-  assert(timeout > std::chrono::milliseconds(0));
-
-  if (service.empty() || method.empty() || !asyncHandler) {
-    return false;
-  }
-
-  if (isRegistered(service, method)) {
-    return false;
-  }
-
-  auto serviceItr = asyncHandlers_.find(service);
-  if (serviceItr == asyncHandlers_.end()) {
-    std::unordered_map<std::string, AsyncMethodEntry> methodMap;
-    methodMap[method] = {std::move(asyncHandler), timeout};
-    asyncHandlers_[service] = std::move(methodMap);
-    return true;
-  }
-
-  auto handlerItr = serviceItr->second.find(method);
-  if (handlerItr == serviceItr->second.end()) {
-    (serviceItr->second)[method] = {std::move(asyncHandler), timeout};
-    return true;
-  }
-
-  return false;
+  return registerAsyncMethodImpl(service, method, std::move(asyncHandler),
+                                 timeout);
 }
 
 bool RpcServer::unregisterMethod(const std::string &service,
@@ -1334,4 +1285,38 @@ void RpcServer::beginClosing() {
   }
 
   server_->stop(gracePeriod);
+}
+
+bool RpcServer::registerAsyncMethodImpl(
+    const std::string &service, const std::string &method,
+    RpcAsyncHandler asyncHandler,
+    std::optional<std::chrono::milliseconds> timeoutOverride) {
+  loop_->assertInLoopThread();
+  assert(status_ == Status::kNotStarted);
+  assert(!timeoutOverride.has_value() ||
+         timeoutOverride.value() > std::chrono::milliseconds(0));
+
+  if (service.empty() || method.empty() || !asyncHandler) {
+    return false;
+  }
+
+  if (isRegistered(service, method)) {
+    return false;
+  }
+
+  auto serviceItr = asyncHandlers_.find(service);
+  if (serviceItr == asyncHandlers_.end()) {
+    std::unordered_map<std::string, AsyncMethodEntry> methodMap;
+    methodMap[method] = {std::move(asyncHandler), timeoutOverride};
+    asyncHandlers_[service] = std::move(methodMap);
+    return true;
+  }
+
+  auto handlerItr = serviceItr->second.find(method);
+  if (handlerItr == serviceItr->second.end()) {
+    (serviceItr->second)[method] = {std::move(asyncHandler), timeoutOverride};
+    return true;
+  }
+
+  return false;
 }

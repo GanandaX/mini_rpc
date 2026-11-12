@@ -494,16 +494,14 @@ void RpcClient::callInLoop(uint64_t requestId, const std::string &service,
         reconnectTimeout = defaultReconnectTimeout_;
       }
 
-      if (!remainingResends) {
-        allowReconnect = false;
-      }
+      const bool canResend = allowReconnect && remainingResends > 0;
 
-      pendingRequests_[requestId] = {service,
-                                     method,
-                                     payload,
+      pendingRequests_[requestId] = {canResend ? service : "",
+                                     canResend ? method : "",
+                                     canResend ? payload : "",
                                      std::move(cb),
                                      timeout,
-                                     allowReconnect,
+                                     canResend,
                                      RequestPhase::kWaitingResponse,
                                      remainingResends,
                                      reconnectTimeout,

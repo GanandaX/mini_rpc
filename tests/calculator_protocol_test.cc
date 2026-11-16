@@ -510,9 +510,6 @@ void calculator_client_reports_error_for_invalid_result_payload_test() {
 }
 
 void calculator_client_uses_default_timeout_and_allows_zero_override_test() {
-
-  std::cout << "-------------------" << std::endl;
-
   int serverFd =
       ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   assert(serverFd >= 0);
@@ -694,6 +691,190 @@ void calculator_client_uses_default_timeout_and_allows_zero_override_test() {
   assert(serverStopped == 1);
 }
 
+void calculator_protocol_preserves_divmod_result_field_order_test() {
+  CalculatorProtocol protocol;
+  std::string encodeStr = protocol.encodeDivModResult(3, 2);
+
+  const std::string expected{"\x00\x00\x00\x03\x00\x00\x00\x02", 8};
+  assert(encodeStr == expected);
+
+  std::string errorMessage;
+  int32_t quotient;
+  int32_t remainder;
+  bool res =
+      protocol.decodeDivModResult(expected, quotient, remainder, errorMessage);
+
+  assert(res && errorMessage.empty());
+  assert(quotient == 3);
+  assert(remainder == 2);
+}
+
+void rpc_calculator_divmod_returns_signed_quotient_and_remainder_test() {
+  int serverFd =
+      ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  assert(serverFd >= 0);
+
+  InetAddress serverAddr("127.0.0.1", 0);
+  socklen_t socketLen = sizeof(sockaddr_in);
+  assert(0 ==
+         ::bind(serverFd,
+                reinterpret_cast<const sockaddr *>(serverAddr.getSockAddr()),
+                socketLen));
+
+  assert(0 ==
+         ::getsockname(serverFd,
+                       reinterpret_cast<sockaddr *>(serverAddr.getSockAddr()),
+                       &socketLen));
+
+  std::promise<void> testCompletePromise;
+  auto testCompleteFuture = testCompletePromise.get_future();
+
+  int connected = 0;
+  int rpcRoundSuccess = 0;
+  int clientDisconnected = 0;
+  int serverStopped = 0;
+
+  EventLoop loop;
+  RpcServer server(&loop, serverFd);
+
+  server.setStopCompleteCallback([&]() {
+    ++serverStopped;
+    testCompletePromise.set_value();
+    loop.quit();
+  });
+
+  CalculatorService service;
+  bool registered = service.registerCalculatorService(server);
+  assert(registered);
+
+  server.start();
+
+  CalculatorClient client(&loop, serverAddr);
+  client.setConnectionCallback([&](const TcpConnectionPtr &conn) {
+    if (conn->connected()) {
+      ++connected;
+
+      client.divmod(-17, 5, [&](DivModResult result) {
+        assert(result.status == ResponseResult::kSuccess);
+        assert(result.errorCode == RpcErrorCode::NO_ERROR);
+        assert(result.quotient == -3);
+        assert(result.remainder == -2);
+        assert(result.errorMessage.empty());
+
+        ++rpcRoundSuccess;
+        client.disconnect();
+      });
+    } else {
+      ++clientDisconnected;
+      server.stop(std::chrono::milliseconds(0));
+    }
+  });
+  client.setConnectionErrorCallback([&](int) { std::abort(); });
+  client.connect();
+
+  loop.runAfter(std::chrono::milliseconds(3000), []() {
+    std::cerr << "test timeout" << std::endl;
+    std::abort();
+  });
+
+  loop.loop();
+
+  auto waitForRes =
+      testCompleteFuture.wait_for(std::chrono::milliseconds(2000));
+  if (waitForRes != std::future_status::ready) {
+    std::cerr << "wait for server destroy timeout" << std::endl;
+    std::abort();
+  }
+
+  assert(connected == 1);
+  assert(rpcRoundSuccess == 1);
+  assert(clientDisconnected == 1);
+  assert(serverStopped == 1);
+}
+
+void rpc_calculator_divmod_reports_division_by_zero_test() {
+  int serverFd =
+      ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  assert(serverFd >= 0);
+
+  InetAddress serverAddr("127.0.0.1", 0);
+  socklen_t socketLen = sizeof(sockaddr_in);
+  assert(0 ==
+         ::bind(serverFd,
+                reinterpret_cast<const sockaddr *>(serverAddr.getSockAddr()),
+                socketLen));
+
+  assert(0 ==
+         ::getsockname(serverFd,
+                       reinterpret_cast<sockaddr *>(serverAddr.getSockAddr()),
+                       &socketLen));
+
+  std::promise<void> testCompletePromise;
+  auto testCompleteFuture = testCompletePromise.get_future();
+
+  int connected = 0;
+  int rpcRound = 0;
+  int clientDisconnected = 0;
+  int serverStopped = 0;
+
+  EventLoop loop;
+  RpcServer server(&loop, serverFd);
+
+  server.setStopCompleteCallback([&]() {
+    ++serverStopped;
+    testCompletePromise.set_value();
+    loop.quit();
+  });
+
+  CalculatorService service;
+  bool registered = service.registerCalculatorService(server);
+  assert(registered);
+
+  server.start();
+
+  CalculatorClient client(&loop, serverAddr);
+  client.setConnectionCallback([&](const TcpConnectionPtr &conn) {
+    if (conn->connected()) {
+      ++connected;
+
+      client.divmod(-17, 0, [&](DivModResult result) {
+        assert(result.status == ResponseResult::kUnsuccess);
+        assert(result.errorCode == RpcErrorCode::BUSINESS_ERROR);
+        assert(result.quotient == 0);
+        assert(result.remainder == 0);
+        assert(result.errorMessage == "divisor equals 0");
+
+        ++rpcRound;
+        client.disconnect();
+      });
+    } else {
+      ++clientDisconnected;
+      server.stop(std::chrono::milliseconds(0));
+    }
+  });
+  client.setConnectionErrorCallback([&](int) { std::abort(); });
+  client.connect();
+
+  loop.runAfter(std::chrono::milliseconds(3000), []() {
+    std::cerr << "test timeout" << std::endl;
+    std::abort();
+  });
+
+  loop.loop();
+
+  auto waitForRes =
+      testCompleteFuture.wait_for(std::chrono::milliseconds(2000));
+  if (waitForRes != std::future_status::ready) {
+    std::cerr << "wait for server destroy timeout" << std::endl;
+    std::abort();
+  }
+
+  assert(connected == 1);
+  assert(rpcRound == 1);
+  assert(clientDisconnected == 1);
+  assert(serverStopped == 1);
+}
+
 int main() {
   calculator_protocol_round_trips_signed_values_test();
   calculator_protocol_uses_big_endian_wire_format_test();
@@ -703,4 +884,7 @@ int main() {
   rpc_calculator_add_returns_error_for_invalid_payload_test();
   calculator_client_reports_error_for_invalid_result_payload_test();
   calculator_client_uses_default_timeout_and_allows_zero_override_test();
+  calculator_protocol_preserves_divmod_result_field_order_test();
+  rpc_calculator_divmod_returns_signed_quotient_and_remainder_test();
+  rpc_calculator_divmod_reports_division_by_zero_test();
 }

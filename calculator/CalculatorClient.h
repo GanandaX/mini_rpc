@@ -16,9 +16,18 @@ struct AddResult {
   std::string errorMessage;
 };
 
+struct DivModResult {
+  ResponseResult status;
+  RpcErrorCode errorCode;
+  int32_t quotient;
+  int32_t remainder;
+  std::string errorMessage;
+};
+
 class CalculatorClient {
 public:
   using AddCallback = std::function<void(AddResult)>;
+  using DivModCallback = std::function<void(DivModResult)>;
 
   explicit CalculatorClient(EventLoop *loop, InetAddress serverAddr);
 
@@ -29,6 +38,14 @@ public:
 
   uint64_t add(int32_t a, int32_t b, AddCallback callback,
                RpcCallOptions options);
+
+  uint64_t divmod(int32_t dividend, int32_t divisor, DivModCallback callback);
+
+  uint64_t divmod(int32_t dividend, int32_t divisor, DivModCallback callback,
+                  std::chrono::milliseconds timeout);
+
+  uint64_t divmod(int32_t dividend, int32_t divisor, DivModCallback callback,
+                  RpcCallOptions options);
 
   void setDefaultTimeout(std::chrono::milliseconds timeout);
 
@@ -48,6 +65,8 @@ public:
 
 private:
   static RpcCallback wrapAddCallback(AddCallback callback);
+
+  static RpcCallback wrapDivModCallback(DivModCallback callback);
 
   RpcClient client_;
 };

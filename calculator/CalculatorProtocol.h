@@ -23,6 +23,14 @@ public:
   std::string resultEncode() const;
   bool resultDecode(const std::string &msg, std::string &errorMessage);
 
+  static std::string encodeDivModResult(int32_t quotient, int32_t remainder);
+
+  static bool decodeDivModResult(const std::string &payload, int32_t &quotient,
+                                 int32_t &remainder, std::string &errorMessage);
+
+private:
+  static std::string encodeInt32Pair(int32_t first, int32_t second);
+
 private:
   int32_t a_;
   int32_t b_;

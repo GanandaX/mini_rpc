@@ -259,6 +259,10 @@ void rpc_client_receives_error_for_unknown_service_test() {
             assert(response.getPayload().empty());
             assert(!response.getErrorMessage().empty());
 
+            auto state = server.stats();
+            assert(state.receivedRequests == 1);
+            assert(state.methodNotFoundRequests == 1);
+
             ++rpcErrorResponseReceived;
             client.disconnect();
           });
@@ -8865,6 +8869,9 @@ void rpc_server_returns_resource_exhausted_when_task_queue_is_full_test() {
                           assert(response.getPayload().empty());
                           assert(response.getErrorMessage() ==
                                  "task queue full");
+
+                          auto state = server.stats();
+                          assert(state.workerQueueFullRejections == 1);
                           ++thirdRequestCallback;
                           releaseFirstTask.set_value();
                         });
@@ -9243,6 +9250,7 @@ void rpc_server_times_out_async_request_when_handler_does_not_reply_test() {
             assert(response.getErrorCode() == RpcErrorCode::REQUEST_TIMEOUT);
             assert(response.getPayload().empty());
             assert(response.getErrorMessage() == "handler running timeout");
+            assert(server.stats().asyncRequestTimeouts == 1);
             ++requestCallback;
 
             assert(savedToken.has_value());

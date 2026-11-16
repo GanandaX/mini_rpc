@@ -119,6 +119,8 @@ private:
       requestsByConnection_;
 
   std::shared_ptr<std::function<void()>> drainedFunc_;
+
+  std::atomic<uint64_t> asyncRequestTimeouts_;
 };
 
 namespace {
@@ -190,7 +192,7 @@ bool completeRequestInLoop(
 
 ServerRequestRegistry::ServerRequestRegistry(
     std::shared_ptr<std::function<void()>> drainedFunc)
-    : drainedFunc_(drainedFunc) {}
+    : drainedFunc_(drainedFunc), asyncRequestTimeouts_(0) {}
 
 RegistrationResult ServerRequestRegistry::tryRegister(
     const TcpConnectionPtr &conn, uint64_t requestId, RequestKind kind,
@@ -491,6 +493,7 @@ ServerRequestRegistry::expire(const TcpConnectionPtr &conn, uint64_t requestId,
   entrys.erase(recordItr);
   --connItr->second.activeAsyncRequests;
   --activeAsyncRequests_;
+  asyncRequestTimeouts_.fetch_add(1, std::memory_order_relaxed);
 
   if (entrys.empty()) {
     requestsByConnection_.erase(connItr);
@@ -559,7 +562,8 @@ void ReplyDispatcher::close() {
 
 RpcServer::RpcServer(EventLoop *loop, int listenFd, int threadNum)
     : loop_(loop), status_(Status::kNotStarted), tcpServerStopped_(false),
-      taskPoolStopped_(false) {
+      taskPoolStopped_(false), receivedRequests_(0), methodNotFoundRequests_(0),
+      workerQueueFullRejections_(0) {
   assert(loop != nullptr);
   assert(listenFd >= 0);
   assert(threadNum >= 0);
@@ -813,6 +817,14 @@ void RpcServer::setAsyncHandlerTimeout(std::chrono::milliseconds timeout) {
   serverRequestRegistry_->setAsyncHandlerTimeout(timeout);
 }
 
+RpcServer::RpcServerStats RpcServer::stats() const {
+  return {receivedRequests_.load(std::memory_order_relaxed),
+          methodNotFoundRequests_.load(std::memory_order_relaxed),
+          workerQueueFullRejections_.load(std::memory_order_relaxed),
+          serverRequestRegistry_->asyncRequestTimeouts_.load(
+              std::memory_order_relaxed)};
+}
+
 void RpcServer::onRpcMessage(const TcpConnectionPtr &conn,
                              const std::string &msg) {
   if (msg.empty()) {
@@ -861,6 +873,7 @@ void RpcServer::onRpcMessage(const TcpConnectionPtr &conn,
     conn->forceClose();
     return;
   }
+  receivedRequests_.fetch_add(1, std::memory_order_relaxed);
 
   if (isRegisteredInSync(request.getService(), request.getMethod())) {
     invokeSyncHandler(conn, request);
@@ -872,6 +885,7 @@ void RpcServer::onRpcMessage(const TcpConnectionPtr &conn,
     return;
   }
 
+  methodNotFoundRequests_.fetch_add(1, std::memory_order_relaxed);
   sendResponse(conn, request.getRequestId(), ResponseResult::kUnsuccess,
                RpcErrorCode::METHOD_NOT_FOUND, "",
                "service or method not exist");
@@ -1189,6 +1203,7 @@ void RpcServer::invokeAsyncHandler(const TcpConnectionPtr &conn,
       errorCode = RpcErrorCode::INTERNAL_ERROR;
       errorMessage = "task pool not running";
     } else if (res == TaskSubmitResult::kQueueFull) {
+      workerQueueFullRejections_.fetch_add(1, std::memory_order_relaxed);
       errorCode = RpcErrorCode::RESOURCE_EXHAUSTED;
       errorMessage = "task queue full";
     } else if (res == TaskSubmitResult::kEmptyTask) {

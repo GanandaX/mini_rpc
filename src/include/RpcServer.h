@@ -60,6 +60,13 @@ public:
     std::string errorMessage;
   };
 
+  struct RpcServerStats {
+    uint64_t receivedRequests;
+    uint64_t methodNotFoundRequests;
+    uint64_t workerQueueFullRejections;
+    uint64_t asyncRequestTimeouts;
+  };
+
 public:
   using StopCompleteCallback = std::function<void()>;
   using RpcHandler = std::function<RpcResult(const std::string &)>;
@@ -100,6 +107,8 @@ public:
   void setMaxWorkerQueue(size_t maxWorkerQueue);
 
   void setAsyncHandlerTimeout(std::chrono::milliseconds timeout);
+
+  RpcServerStats stats() const;
 
 private:
   void onRpcMessage(const TcpConnectionPtr &, const std::string &);
@@ -158,6 +167,9 @@ private:
   Status status_;
   bool tcpServerStopped_;
   bool taskPoolStopped_;
+  std::atomic<uint64_t> receivedRequests_;
+  std::atomic<uint64_t> methodNotFoundRequests_;
+  std::atomic<uint64_t> workerQueueFullRejections_;
 
   std::unique_ptr<TaskThreadPool> taskPool_;
   std::thread taskPoolStopThread_;

@@ -24,6 +24,7 @@ struct RpcCallOptions {
   std::optional<bool> allowResend;
   std::optional<std::chrono::milliseconds> reconnectTimeout;
   std::optional<uint8_t> resendLimit;
+  std::optional<std::chrono::milliseconds> totalTimeout;
 };
 
 class RpcClient {
@@ -52,7 +53,8 @@ public:
       const std::string &payload, RpcCallback cb,
       std::chrono::milliseconds timeout, bool allowReconnect,
       std::chrono::milliseconds reconnectTimeout = std::chrono::milliseconds(0),
-      std::optional<uint8_t> resendLimit = std::nullopt);
+      std::optional<uint8_t> resendLimit = std::nullopt,
+      std::optional<std::chrono::milliseconds> totalTimeout = std::nullopt);
 
   uint64_t call(const std::string &service, const std::string &method,
                 const std::string &payload, RpcCallback cb,
@@ -97,12 +99,13 @@ private:
   void onRequestTimeout(uint64_t requestId);
   void onReconnectTimeout(uint64_t requestId);
 
-  void callInLoop(uint64_t requestId, const std::string &service,
-                  const std::string &method, const std::string &payload,
-                  RpcCallback cb, std::chrono::milliseconds timeout,
-                  bool allowReconnect,
-                  std::chrono::milliseconds reconnectTimeout,
-                  std::optional<uint8_t> resendLimit);
+  void
+  callInLoop(uint64_t requestId, const std::string &service,
+             const std::string &method, const std::string &payload,
+             RpcCallback cb, std::chrono::milliseconds timeout,
+             bool allowReconnect, std::chrono::milliseconds reconnectTimeout,
+             std::optional<uint8_t> resendLimit,
+             std::optional<std::chrono::steady_clock::time_point> deadline);
 
   void clearExpiredIgnoredResponseRequests();
 
@@ -114,6 +117,8 @@ private:
   void sendCancel(uint64_t requestId);
 
   void checkReconnect();
+
+  void deadlineTimeout(uint64_t requestId);
 
 private:
   enum class Status { kDisconnected, kConnecting, kDisconnecting, kConnected };
@@ -136,7 +141,10 @@ private:
     std::chrono::milliseconds reconnectTimeout;
 
     std::optional<TimerId> timerId;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
   };
+
+  std::shared_ptr<bool> lifetimeToken_;
 
   bool hasConnectAttempted_;
   std::atomic<uint64_t> nextRequestId_ = 1;

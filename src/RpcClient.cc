@@ -5,7 +5,8 @@
 #include <vector>
 
 RpcClient::RpcClient(EventLoop *loop, const InetAddress &serverAddr)
-    : hasConnectAttempted_(false), maxPendingRequests_(std::nullopt),
+    : lifetimeToken_(std::make_shared<bool>(true)), hasConnectAttempted_(false),
+      maxPendingRequests_(std::nullopt),
       defaultTimeout_(std::chrono::milliseconds(0)), loop_(checkedLoop(loop)),
       status_(Status::kDisconnected), tcpClient_(loop_, serverAddr),
       clearIgnoredResponseRequestsTimerId_(std::nullopt),
@@ -28,13 +29,21 @@ RpcClient::RpcClient(EventLoop *loop, const InetAddress &serverAddr)
   tcpClient_.setPeerHalfCloseCallback(
       [](const TcpConnectionPtr &conn) { conn->shutdown(); });
 
-  clearIgnoredResponseRequestsTimerId_ = loop_->runEvery(
-      std::chrono::milliseconds(1000),
-      std::bind(&RpcClient::clearExpiredIgnoredResponseRequests, this));
+  std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
+  clearIgnoredResponseRequestsTimerId_ =
+      loop_->runEvery(std::chrono::milliseconds(1000), [&, lifetimeToken]() {
+        if (lifetimeToken.expired()) {
+          return;
+        }
+
+        clearExpiredIgnoredResponseRequests();
+      });
 }
 
 RpcClient::~RpcClient() {
   loop_->assertInLoopThread();
+
+  lifetimeToken_.reset();
 
   clearPendingRequests();
   clearIgnoredResponseRequests();
@@ -96,26 +105,38 @@ uint64_t RpcClient::call(const std::string &service, const std::string &method,
   return call(service, method, payload, cb, timeout, defaultAllowResend_);
 }
 
-uint64_t RpcClient::call(const std::string &service, const std::string &method,
-                         const std::string &payload, RpcCallback cb,
-                         std::chrono::milliseconds timeout, bool allowResend,
-                         std::chrono::milliseconds reconnectTimeout,
-                         std::optional<uint8_t> resendLimit) {
+uint64_t
+RpcClient::call(const std::string &service, const std::string &method,
+                const std::string &payload, RpcCallback cb,
+                std::chrono::milliseconds timeout, bool allowResend,
+                std::chrono::milliseconds reconnectTimeout,
+                std::optional<uint8_t> resendLimit,
+                std::optional<std::chrono::milliseconds> totalTimeout) {
   assert(cb != nullptr);
   assert(timeout >= std::chrono::milliseconds{0});
   assert(reconnectTimeout >= std::chrono::milliseconds(0));
 
   uint64_t requestId = nextRequestId_.fetch_add(1);
 
+  std::optional<std::chrono::steady_clock::time_point> deadLine = std::nullopt;
+  if (totalTimeout.has_value()) {
+    deadLine = std::chrono::steady_clock::now() + totalTimeout.value();
+  }
+
   if (loop_->isInLoopThread()) {
     callInLoop(requestId, service, method, payload, std::move(cb), timeout,
-               allowResend, reconnectTimeout, resendLimit);
+               allowResend, reconnectTimeout, resendLimit, deadLine);
   } else {
+    std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
     loop_->queueInLoop([this, requestId, service, method, payload,
                         callback = std::move(cb), timeout, allowResend,
-                        reconnectTimeout, resendLimit]() mutable {
+                        reconnectTimeout, resendLimit, deadLine,
+                        lifetimeToken]() mutable {
+      if (lifetimeToken.expired()) {
+        return;
+      }
       callInLoop(requestId, service, method, payload, std::move(callback),
-                 timeout, allowResend, reconnectTimeout, resendLimit);
+                 timeout, allowResend, reconnectTimeout, resendLimit, deadLine);
     });
   }
   return requestId;
@@ -128,7 +149,8 @@ uint64_t RpcClient::call(const std::string &service, const std::string &method,
               callOptions.timeout.value_or(defaultTimeout_),
               callOptions.allowResend.value_or(defaultAllowResend_),
               callOptions.reconnectTimeout.value_or(defaultReconnectTimeout_),
-              callOptions.resendLimit.value_or(defaultResendLimit_));
+              callOptions.resendLimit.value_or(defaultResendLimit_),
+              callOptions.totalTimeout);
 }
 
 void RpcClient::enableRetry() {
@@ -176,7 +198,13 @@ void RpcClient::cancel(uint64_t requestId) {
   if (loop_->isInLoopThread()) {
     cancelInLoop(requestId);
   } else {
-    loop_->queueInLoop([this, requestId]() { cancelInLoop(requestId); });
+    std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
+    loop_->queueInLoop([this, requestId, lifetimeToken]() {
+      if (lifetimeToken.expired()) {
+        return;
+      }
+      cancelInLoop(requestId);
+    });
   }
 }
 
@@ -353,9 +381,33 @@ void RpcClient::failAllDisreconnectRequests(RpcErrorCode errorCode,
       it->second.timerId.reset();
     }
 
+    std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
+    auto effectiveTimeout = it->second.reconnectTimeout;
+    auto deadline = it->second.deadline;
+    if (deadline.has_value()) {
+      auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        deadlineTimeout(it->first);
+        continue;
+      }
+
+      auto interval =
+          std::chrono::ceil<std::chrono::milliseconds>(deadline.value() - now);
+      if (effectiveTimeout.count() == 0) {
+        effectiveTimeout = interval;
+      } else {
+        effectiveTimeout = interval.count() > effectiveTimeout.count()
+                               ? effectiveTimeout
+                               : interval;
+      }
+    }
     TimerId timerId = loop_->runAfter(
-        it->second.reconnectTimeout,
-        std::bind(&RpcClient::onReconnectTimeout, this, it->first));
+        effectiveTimeout, [&, requestId = it->first, lifetimeToken]() {
+          if (lifetimeToken.expired()) {
+            return;
+          }
+          onReconnectTimeout(requestId);
+        });
     it->second.timerId = timerId;
   }
 
@@ -423,33 +475,79 @@ void RpcClient::onReconnectTimeout(uint64_t requestId) {
 
   findRes->second.remainingResends--;
 
-  if (!findRes->second.remainingResends) {
+  auto deadline = findRes->second.deadline;
+  if (!findRes->second.remainingResends ||
+      (deadline.has_value() && std::chrono::steady_clock::now() >= deadline)) {
     PendingRequest pendingRequest = std::move(findRes->second);
+
+    RpcErrorCode erroCode;
+    std::string errorMessage;
+    if (deadline.has_value() && std::chrono::steady_clock::now() >= deadline) {
+      erroCode = RpcErrorCode::REQUEST_TIMEOUT;
+      errorMessage = "request timeout";
+    } else {
+      erroCode = RpcErrorCode::RECONNECT_TIMEOUT;
+      errorMessage = "rpc reconnect timeout";
+    }
+
     pendingRequests_.erase(findRes);
 
-    RpcResponse response(requestId, ResponseResult::kUnsuccess,
-                         RpcErrorCode::RECONNECT_TIMEOUT, "",
-                         "rpc reconnect timeout");
+    RpcResponse response(requestId, ResponseResult::kUnsuccess, erroCode, "",
+                         errorMessage);
     (pendingRequest.callback)(response);
     return;
   }
 
-  TimerId timerId = loop_->runAfter(
-      findRes->second.reconnectTimeout,
-      std::bind(&RpcClient::onReconnectTimeout, this, requestId));
+  std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
+  auto effectiveTimeout = findRes->second.reconnectTimeout;
+  if (deadline.has_value()) {
+    auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      deadlineTimeout(findRes->first);
+      return;
+    }
+
+    auto interval =
+        std::chrono::ceil<std::chrono::milliseconds>(deadline.value() - now);
+    if (effectiveTimeout.count() == 0) {
+      effectiveTimeout = interval;
+    } else {
+      effectiveTimeout = interval.count() > effectiveTimeout.count()
+                             ? effectiveTimeout
+                             : interval;
+    }
+  }
+  TimerId timerId =
+      loop_->runAfter(effectiveTimeout, [&, requestId, lifetimeToken]() {
+        if (lifetimeToken.expired()) {
+          return;
+        }
+        onReconnectTimeout(requestId);
+      });
   pendingRequests_[requestId].timerId = timerId;
 }
 
-void RpcClient::callInLoop(uint64_t requestId, const std::string &service,
-                           const std::string &method,
-                           const std::string &payload, RpcCallback cb,
-                           std::chrono::milliseconds timeout,
-                           bool allowReconnect,
-                           std::chrono::milliseconds reconnectTimeout,
-                           std::optional<uint8_t> resendLimit) {
+void RpcClient::callInLoop(
+    uint64_t requestId, const std::string &service, const std::string &method,
+    const std::string &payload, RpcCallback cb,
+    std::chrono::milliseconds timeout, bool allowReconnect,
+    std::chrono::milliseconds reconnectTimeout,
+    std::optional<uint8_t> resendLimit,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
   loop_->assertInLoopThread();
   assert(timeout >= std::chrono::milliseconds{0});
   assert(cb != nullptr);
+
+  if (deadline.has_value()) {
+    auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      RpcResponse response(requestId, ResponseResult::kUnsuccess,
+                           RpcErrorCode::REQUEST_TIMEOUT, "",
+                           "request timeout");
+      cb(response);
+      return;
+    }
+  }
 
   RpcErrorCode errorCode = RpcErrorCode::NO_ERROR;
   std::string errorMessage;
@@ -496,6 +594,28 @@ void RpcClient::callInLoop(uint64_t requestId, const std::string &service,
 
       const bool canResend = allowReconnect && remainingResends > 0;
 
+      auto effectiveTimeout = timeout;
+      if (deadline.has_value()) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+          RpcResponse response(requestId, ResponseResult::kUnsuccess,
+                               RpcErrorCode::REQUEST_TIMEOUT, "",
+                               "request timeout");
+          cb(response);
+          return;
+        }
+
+        auto interval = std::chrono::ceil<std::chrono::milliseconds>(
+            deadline.value() - now);
+        if (effectiveTimeout.count() == 0) {
+          effectiveTimeout = interval;
+        } else {
+          effectiveTimeout = interval.count() > effectiveTimeout.count()
+                                 ? effectiveTimeout
+                                 : interval;
+        }
+      }
+
       pendingRequests_[requestId] = {canResend ? service : "",
                                      canResend ? method : "",
                                      canResend ? payload : "",
@@ -505,10 +625,17 @@ void RpcClient::callInLoop(uint64_t requestId, const std::string &service,
                                      RequestPhase::kWaitingResponse,
                                      remainingResends,
                                      reconnectTimeout,
-                                     std::nullopt};
-      if (timeout > std::chrono::milliseconds(0)) {
-        TimerId timerId = loop_->runAfter(
-            timeout, std::bind(&RpcClient::onRequestTimeout, this, requestId));
+                                     std::nullopt,
+                                     deadline};
+      if (effectiveTimeout > std::chrono::milliseconds(0)) {
+        std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
+        TimerId timerId =
+            loop_->runAfter(effectiveTimeout, [&, requestId, lifetimeToken]() {
+              if (lifetimeToken.expired()) {
+                return;
+              }
+              onRequestTimeout(requestId);
+            });
         pendingRequests_[requestId].timerId = timerId;
       }
 
@@ -652,13 +779,58 @@ void RpcClient::checkReconnect() {
       continue;
     }
 
-    if (it->second.requestTimeout > std::chrono::milliseconds(0)) {
-      TimerId timerId = loop_->runAfter(
-          it->second.requestTimeout,
-          std::bind(&RpcClient::onRequestTimeout, this, it->first));
+    auto effectiveTimeout = it->second.requestTimeout;
+    auto deadline = it->second.deadline;
+    auto requestId = it->first;
+    auto cb = it->second.callback;
+    if (deadline.has_value()) {
+      auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        deadlineTimeout(requestId);
+        continue;
+      }
+
+      auto interval =
+          std::chrono::ceil<std::chrono::milliseconds>(deadline.value() - now);
+      if (effectiveTimeout.count() == 0) {
+        effectiveTimeout = interval;
+      } else {
+        effectiveTimeout = interval.count() > effectiveTimeout.count()
+                               ? effectiveTimeout
+                               : interval;
+      }
+    }
+
+    if (effectiveTimeout > std::chrono::milliseconds(0)) {
+      std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
+      TimerId timerId =
+          loop_->runAfter(effectiveTimeout, [&, requestId, lifetimeToken]() {
+            if (lifetimeToken.expired()) {
+              return;
+            }
+            onRequestTimeout(requestId);
+          });
       it->second.timerId = timerId;
     }
 
     codec_.send(conn, output.data(), output.length());
   }
+}
+
+void RpcClient::deadlineTimeout(uint64_t requestId) {
+  auto findRes = pendingRequests_.find(requestId);
+  if (findRes == pendingRequests_.end()) {
+    return;
+  }
+
+  auto cb = std::move(findRes->second.callback);
+
+  pendingRequests_.erase(requestId);
+  auto oneMinuteLater =
+      std::chrono::steady_clock::now() + std::chrono::minutes(1);
+  ignoredResponseRequests_[requestId] = oneMinuteLater;
+
+  RpcResponse response(requestId, ResponseResult::kUnsuccess,
+                       RpcErrorCode::REQUEST_TIMEOUT, "", "request timeout");
+  cb(response);
 }

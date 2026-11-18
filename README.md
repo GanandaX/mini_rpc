@@ -192,7 +192,7 @@ setMaxMessageSize(size_t);
  重连后自动重发请求
  Tcp的自动重连和RpcClient的重连后自动重发请求是两独立的开关, 默认只有一次重发机会
  响应超时是指一个请求发送至server端后指定时常内没收到响应则超时，等待重连超时是指连接在非客户端主动断开后指定时常内没重新连接则超时。
- 意外断线后取消原响应定时器，开始等待重连；重发时重新计算完整的响应超时。单次 TCP 重连失败不重置等待期限。
+ 意外断线后取消原响应定时器，开始等待重连；重发时重新计算响应超时，同时受最初总截止时间约束，按较早的有效期限结束请求。单次 TCP 重连失败不重置等待期限。
  响应超时："rpc request timeout"。等待重连超时："rpc reconnect timeout"。
  默认是tcp不自动重连且重连后不会重发Rpc请求，默认重连时常为1s。若需开启重连后自动重发要开启Tcp的自动重连，且在call时配置重连后自动重发并配置重连超时时间；
  还可使用全局配置setAllowReconnect和setDefaultReconnectTimeout但必须在首次 connect() 前、client 所属 EventLoop 线程中。
@@ -242,7 +242,7 @@ setMaxMessageSize(size_t);
             std::chrono::milliseconds(1000), true, std::chrono::milliseconds(500),
             2);
 
-    // 通过call配置自动重发，默认次数为 5，本次指定 2，使用本次配置，开启重连后重发，重发超时时间沿用客户端默认值
+    // 通过call配置自动重发，默认次数为 5，本次指定 2，使用本次配置，开启重连后重发，重发超时时间沿用客户端默认值,totalTimeout 从调用 call() 开始计时，包含排队、等待重连和重发。到期后请求以超时结束，回调由客户端 EventLoop 执行，loop 阻塞时可能延后
     RpcClient client(&loop, serverAddr);
     client.enableRetry();
     client.setDefaultResendLimit(5);
@@ -250,6 +250,7 @@ setMaxMessageSize(size_t);
     RpcCallOptions options;
     options.allowResend = true;
     options.resendLimit = 2;
+    options.totalTimeout = std::chrono::milliseconds(1000);
     client.call("EchoService", "Echo", "hello world",
           [&](const RpcResponse &response) {
                 ...
@@ -391,7 +392,7 @@ client.add(1, 2, [&](AddResult result) {
 
 ## 请求生命周期
 
-- `timeout == 0ms` 表示永不超时；
+- timeout == 0ms 关闭单次响应超时；设置了 totalTimeout 时仍受总时限约束。”
 - 超时 callback 收到失败响应；
 - 迟到响应会被忽略；
 - 真正未知的 response requestId 会关闭连接；

@@ -9783,6 +9783,376 @@ void rpc_server_prefers_method_timeout_over_global_timeout_test() {
   assert(serverStopped == 1);
 }
 
+void rpc_client_total_timeout_expires_while_waiting_for_reconnect_test() {
+  int serverFd =
+      ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  assert(serverFd >= 0);
+
+  InetAddress serverAddr("127.0.0.1", 0);
+  socklen_t socketLen = sizeof(sockaddr_in);
+  assert(0 ==
+         ::bind(serverFd,
+                reinterpret_cast<const sockaddr *>(serverAddr.getSockAddr()),
+                socketLen));
+
+  assert(0 ==
+         ::getsockname(serverFd,
+                       reinterpret_cast<sockaddr *>(serverAddr.getSockAddr()),
+                       &socketLen));
+
+  std::promise<void> clientTimeoutCallbackPromise;
+  auto clientTimeoutCallbackFuture = clientTimeoutCallbackPromise.get_future();
+
+  int connected = 0;
+  int serverHandled = 0;
+  int requestCallback = 0;
+  int clientDisconnected = 0;
+  int serverStopped = 0;
+
+  std::chrono::steady_clock::time_point start;
+
+  EventLoop loop;
+  RpcServer server(&loop, serverFd);
+  RpcClient client(&loop, serverAddr);
+
+  server.setStopCompleteCallback([&]() { ++serverStopped; });
+
+  bool registered = server.registerAsyncMethod(
+      "EchoService", "Echo",
+      [&](const std::string &payload, RpcCancellationToken cancellation,
+          RpcServer::RpcReply reply) {
+        assert(loop.isInLoopThread());
+        ++serverHandled;
+        server.stop(std::chrono::milliseconds(0));
+      },
+      std::chrono::milliseconds(500));
+  assert(registered);
+
+  server.start();
+
+  client.enableRetry();
+  client.setConnectionCallback([&](const TcpConnectionPtr &conn) {
+    if (conn->connected()) {
+      ++connected;
+      start = std::chrono::steady_clock::now();
+      client.call(
+          "EchoService", "Echo", "hello world",
+          [&](const RpcResponse &response) {
+            loop.assertInLoopThread();
+            assert(serverStopped == 1);
+            assert(clientDisconnected == 1);
+            assert(response.getResponseResult() == ResponseResult::kUnsuccess);
+            assert(response.getErrorCode() == RpcErrorCode::REQUEST_TIMEOUT);
+            assert(response.getPayload().empty());
+            assert(response.getErrorMessage() == "request timeout");
+            ++requestCallback;
+
+            auto duration =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start);
+            assert(duration >= std::chrono::milliseconds(1000));
+            assert(duration < std::chrono::milliseconds(2000));
+
+            client.disconnect();
+            clientTimeoutCallbackPromise.set_value();
+            loop.quit();
+          },
+          std::chrono::milliseconds(0), true, std::chrono::milliseconds(3000),
+          2, std::chrono::milliseconds(1000));
+    } else {
+      ++clientDisconnected;
+    }
+  });
+  client.connect();
+
+  loop.runAfter(std::chrono::milliseconds(3000), []() {
+    std::cerr << "test timeout" << std::endl;
+    std::abort();
+  });
+
+  loop.loop();
+
+  auto waitForRes =
+      clientTimeoutCallbackFuture.wait_for(std::chrono::milliseconds(2000));
+  if (waitForRes != std::future_status::ready) {
+    std::cerr << "wait for client timeout callback complete timeout"
+              << std::endl;
+    std::abort();
+  }
+
+  assert(connected == 1);
+  assert(serverHandled == 1);
+  assert(requestCallback == 1);
+  assert(clientDisconnected == 1);
+  assert(serverStopped == 1);
+}
+
+void rpc_client_does_not_send_request_when_total_timeout_expires_before_dispatch_test() {
+  int serverFd =
+      ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  assert(serverFd >= 0);
+
+  InetAddress serverAddr("127.0.0.1", 0);
+  socklen_t socketLen = sizeof(sockaddr_in);
+  assert(0 ==
+         ::bind(serverFd,
+                reinterpret_cast<const sockaddr *>(serverAddr.getSockAddr()),
+                socketLen));
+
+  assert(0 ==
+         ::getsockname(serverFd,
+                       reinterpret_cast<sockaddr *>(serverAddr.getSockAddr()),
+                       &socketLen));
+
+  std::promise<void> serverStopCompletePromise;
+  auto serverStopCompleteFuture = serverStopCompletePromise.get_future();
+  std::promise<void> callInvokedPromise;
+  auto callInvokedFuture = callInvokedPromise.get_future();
+
+  int connected = 0;
+  int serverHandled = 0;
+  int requestCallback = 0;
+  int clientDisconnected = 0;
+  int serverStopped = 0;
+
+  std::chrono::steady_clock::time_point start;
+
+  EventLoop loop;
+  RpcServer server(&loop, serverFd);
+  RpcClient client(&loop, serverAddr);
+  EventLoopThread loopThread;
+  auto threadLoop = loopThread.startLoop();
+
+  server.setStopCompleteCallback([&]() {
+    ++serverStopped;
+    serverStopCompletePromise.set_value();
+    loop.quit();
+  });
+
+  bool registered = server.registerAsyncMethod(
+      "EchoService", "Echo",
+      [&](const std::string &payload, RpcCancellationToken cancellation,
+          RpcServer::RpcReply reply) {
+        assert(loop.isInLoopThread());
+        ++serverHandled;
+      });
+  assert(registered);
+
+  server.start();
+
+  client.enableRetry();
+  client.setConnectionCallback([&](const TcpConnectionPtr &conn) {
+    if (conn->connected()) {
+      ++connected;
+
+      loop.queueInLoop([&]() {
+        auto waitForRes =
+            callInvokedFuture.wait_for(std::chrono::milliseconds(2000));
+        if (waitForRes != std::future_status::ready) {
+          std::cerr << "wait for call invoked timeout" << std::endl;
+          std::abort();
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+      });
+
+      threadLoop->runInLoop([&]() {
+        start = std::chrono::steady_clock::now();
+        client.call(
+            "EchoService", "Echo", "hello world",
+            [&](const RpcResponse &response) {
+              loop.assertInLoopThread();
+
+              auto duration =
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - start);
+              assert(duration >= std::chrono::milliseconds(2000));
+
+              assert(response.getResponseResult() ==
+                     ResponseResult::kUnsuccess);
+              assert(response.getErrorCode() == RpcErrorCode::REQUEST_TIMEOUT);
+              assert(response.getPayload().empty());
+              assert(response.getErrorMessage() == "request timeout");
+              ++requestCallback;
+
+              client.disconnect();
+            },
+            std::chrono::milliseconds(0), true, std::chrono::milliseconds(3000),
+            2, std::chrono::milliseconds(1000));
+        callInvokedPromise.set_value();
+      });
+
+    } else {
+      ++clientDisconnected;
+      server.stop(std::chrono::milliseconds(1000));
+    }
+  });
+  client.connect();
+
+  loop.runAfter(std::chrono::milliseconds(3000), []() {
+    std::cerr << "test timeout" << std::endl;
+    std::abort();
+  });
+
+  loop.loop();
+
+  auto waitForRes =
+      serverStopCompleteFuture.wait_for(std::chrono::milliseconds(2000));
+  if (waitForRes != std::future_status::ready) {
+    std::cerr << "wait for server stop complete timeout" << std::endl;
+    std::abort();
+  }
+
+  assert(connected == 1);
+  assert(serverHandled == 0);
+  assert(requestCallback == 1);
+  assert(clientDisconnected == 1);
+  assert(serverStopped == 1);
+}
+
+void rpc_client_preserves_total_deadline_after_resend_test() {
+  int serverFd =
+      ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  assert(serverFd >= 0);
+
+  InetAddress serverAddr("127.0.0.1", 0);
+  socklen_t socketLen = sizeof(sockaddr_in);
+  assert(0 ==
+         ::bind(serverFd,
+                reinterpret_cast<const sockaddr *>(serverAddr.getSockAddr()),
+                socketLen));
+
+  assert(0 ==
+         ::getsockname(serverFd,
+                       reinterpret_cast<sockaddr *>(serverAddr.getSockAddr()),
+                       &socketLen));
+
+  std::promise<void> serverStopCompletePromise;
+  auto serverStopCompleteFuture = serverStopCompletePromise.get_future();
+
+  int connected = 0;
+  int serverHandled = 0;
+  int requestCallback = 0;
+  int clientDisconnected = 0;
+  int serverStopped = 0;
+
+  std::chrono::steady_clock::time_point start;
+
+  EventLoop loop;
+  RpcClient client(&loop, serverAddr);
+  TcpServer server(&loop, serverFd);
+  LengthHeaderCodec codec;
+
+  std::optional<uint64_t> requestId;
+
+  codec.setMessageCallback(
+      [&](const TcpConnectionPtr &conn, const std::string &msg) {
+        RpcMessageType messageType;
+        bool res = decodeHead(msg, messageType);
+        assert(res);
+        if (messageType != RpcMessageType::kRequest) {
+          return;
+        }
+
+        RpcRequest request;
+        std::string errorMessage;
+        res = request.decode(msg, errorMessage);
+        if (!res || !errorMessage.empty()) {
+          std::cerr << __LINE__ << "server decode error" << std::endl;
+          std::abort();
+          return;
+        }
+
+        ++serverHandled;
+
+        if (serverHandled == 1) {
+          requestId = request.getRequestId();
+
+          loop.runAfter(std::chrono::milliseconds(500),
+                        [conn]() { conn->forceClose(); });
+        } else {
+          assert(requestId.value() == request.getRequestId());
+        }
+      });
+
+  server.setMessageCallback(std::bind(&LengthHeaderCodec::onMessage, &codec,
+                                      std::placeholders::_1,
+                                      std::placeholders::_2));
+
+  server.setStopCompleteCallback([&]() {
+    loop.queueInLoop([&]() {
+      ++serverStopped;
+      serverStopCompletePromise.set_value();
+      loop.quit();
+    });
+  });
+  server.setPeerHalfCloseCallback(
+      [&](const TcpConnectionPtr &conn) { conn->shutdown(); });
+  server.start();
+
+  client.enableRetry();
+  client.setConnectionCallback([&](const TcpConnectionPtr &conn) {
+    if (conn->connected()) {
+      ++connected;
+
+      if (connected != 1) {
+        return;
+      }
+
+      start = std::chrono::steady_clock::now();
+      client.call(
+          "EchoService", "Echo", "hello world",
+          [&](const RpcResponse &response) {
+            loop.assertInLoopThread();
+
+            auto duration =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start);
+            assert(duration >= std::chrono::milliseconds(1000));
+            assert(duration < std::chrono::milliseconds(1400));
+
+            assert(response.getResponseResult() == ResponseResult::kUnsuccess);
+            assert(response.getErrorCode() == RpcErrorCode::REQUEST_TIMEOUT);
+            assert(response.getPayload().empty());
+            assert(response.getErrorMessage() == "rpc request timeout");
+            ++requestCallback;
+
+            client.disconnect();
+          },
+          std::chrono::milliseconds(0), true, std::chrono::milliseconds(3000),
+          2, std::chrono::milliseconds(1000));
+
+    } else {
+      ++clientDisconnected;
+
+      if (clientDisconnected != 1) {
+        server.stop(std::chrono::milliseconds(1000));
+      }
+    }
+  });
+  client.connect();
+
+  loop.runAfter(std::chrono::milliseconds(3000), []() {
+    std::cerr << "test timeout" << std::endl;
+    std::abort();
+  });
+
+  loop.loop();
+
+  auto waitForRes =
+      serverStopCompleteFuture.wait_for(std::chrono::milliseconds(2000));
+  if (waitForRes != std::future_status::ready) {
+    std::cerr << "wait for server stop complete timeout" << std::endl;
+    std::abort();
+  }
+
+  assert(connected == 2);
+  assert(serverHandled == 2);
+  assert(requestCallback == 1);
+  assert(clientDisconnected == 2);
+  assert(serverStopped == 1);
+}
+
 int main() {
   rpc_server_processes_echo_request_test();
   rpc_client_calls_echo_service_test();
@@ -9867,4 +10237,7 @@ int main() {
   rpc_server_completes_graceful_stop_when_last_async_request_times_out_test();
   rpc_server_applies_method_timeout_without_global_timeout_test();
   rpc_server_prefers_method_timeout_over_global_timeout_test();
+  rpc_client_total_timeout_expires_while_waiting_for_reconnect_test();
+  rpc_client_does_not_send_request_when_total_timeout_expires_before_dispatch_test();
+  rpc_client_preserves_total_deadline_after_resend_test();
 }

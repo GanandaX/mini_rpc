@@ -428,6 +428,8 @@ KVM 虚拟机，16 vCPU，内存显示为 15 GiB。
 Ubuntu 20.04.4 LTS，GCC 9.4.0。
 ```
 
+### 测试1
+
 `服务端和客户端运行在同一台 KVM 虚拟机的两个进程中，通过 127.0.0.1 通信。两端均采用 Release 构建，payload 为 64 字节，使用单连接，每次收到响应后再发送下一次请求。每轮测量 5 秒，共三轮。`
 
 ```bash
@@ -443,7 +445,7 @@ cmake --build build-release --target rpc_echo_server_example rpc_echo_benchmark 
 `终端2`
 ```bash
 for i in 1 2 3; do
-  ./build-release/rpc_echo_benchmark 127.0.0.1 12345 service echo 64 5
+  ./build-release/rpc_echo_benchmark 127.0.0.1 12345 service echo 64 5 1
 done
 ```
 
@@ -455,3 +457,23 @@ done
 | 3 | 131323 | 26264.6 |
 
 `中位数为 27615.2 次/秒，三轮范围约为 2.63 万～3.06 万次/秒。这些波动说明后续比较优化效果时，需要保持环境和测量条件一致，并观察多轮结果。`
+
+### 测试2
+`服务端和客户端运行在同一台 KVM 虚拟机的两个进程中，通过 127.0.0.1 通信。两端均采用 Release 构建，payload 为 64 字节，使用单连接，采用两组对照测试，第一组每次收到响应后再发送下一次请求，第二组最多可同时等待8个请求响应。每轮测量 5 秒，共两轮。`
+
+`终端1`
+```bash
+./build-release/rpc_echo_server_example 12345
+```
+
+`终端2` 分两次测试
+```bash
+./build-release/rpc_echo_benchmark 127.0.0.1 12345 service echo 64 5 1
+```
+```bash
+./build-release/rpc_echo_benchmark 127.0.0.1 12345 service echo 64 5 8
+```
+| 并发数 | 第一轮（次/秒） | 第二轮（次/秒） | 两轮平均 |
+|---|---:|---:|---:|
+| 1 | 26607.8 | 28633.4 | 27620.6 |
+| 8 | 168320.6 | 161605.8 | 164963.2 |

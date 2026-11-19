@@ -1,31 +1,42 @@
 #include <InetAddress.h>
 #include <RpcClient.h>
 
-#include <cmath>
-#include <stdlib.h>
 #include <cerrno>
+#include <cmath>
+#include <limits>
+#include <stdlib.h>
+
+bool measurementFinished = false;
+uint64_t sentFrameCnt = 0;
+uint64_t receivedFrameCnt = 0;
 
 void clientCall(
     RpcClient &client, std::string &service, std::string &method,
     std::string &payload,
     std::function<bool(const RpcResponse &response)> &callbackFunc) {
 
+  ++sentFrameCnt;
   client.call(service, method, payload, [&](const RpcResponse &response) {
     if (callbackFunc(response)) {
       clientCall(client, service, method, payload, callbackFunc);
     } else {
-      client.disconnect();
+      ++receivedFrameCnt;
+      if (sentFrameCnt == receivedFrameCnt) {
+        client.disconnect();
+      }
     }
   });
 }
 
 void printResult(std::chrono::steady_clock::time_point start,
-                 uint64_t receivedFrameCnt, size_t payloadSize) {
+                 uint64_t receivedFrameCnt, size_t payloadSize,
+                 int concurrencyCnt) {
   int64_t elapsedMilliseconds =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - start)
           .count();
-  std::cout << "received frame count: " << receivedFrameCnt << std::endl
+  std::cout << "max pending cnt: " << concurrencyCnt << std::endl
+            << "received frame count: " << receivedFrameCnt << std::endl
             << "elapsed: " << elapsedMilliseconds << " milliseconds"
             << std::endl
             << "task/second: "
@@ -34,9 +45,9 @@ void printResult(std::chrono::steady_clock::time_point start,
 }
 
 int main(int argc, char *argv[]) {
-  if (argc != 7) {
+  if (argc != 8) {
     std::cerr << "usage: ./rpc_echo_benchmark server_ip server_port service "
-                 "method payload_length test_seconds"
+                 "method payload_length test_seconds concurrency"
               << std::endl;
     return -1;
   }
@@ -45,7 +56,7 @@ int main(int argc, char *argv[]) {
   errno = 0;
   long parsedPort = strtol(argv[2], &endptr, 10);
   if (errno == ERANGE || endptr == argv[2] || *endptr != '\0') {
-    std::cout << "trans error" << std::endl;
+    std::cout << "port trans error" << std::endl;
     return -1;
   }
   if (parsedPort < 1 || parsedPort > 65535) {
@@ -61,7 +72,7 @@ int main(int argc, char *argv[]) {
   }
   uint64_t parsedPayloadLength = strtoll(argv[5], &endptr, 10);
   if (errno == ERANGE || endptr == argv[5] || *endptr != '\0') {
-    std::cout << "trans error" << std::endl;
+    std::cout << "payload length trans error" << std::endl;
     return -1;
   }
   if (parsedPayloadLength > (64 << 10)) {
@@ -73,7 +84,7 @@ int main(int argc, char *argv[]) {
   errno = 0;
   double parsedTestSeconds = strtod(argv[6], &endptr);
   if (errno == ERANGE || endptr == argv[6] || *endptr != '\0') {
-    std::cout << "trans error" << std::endl;
+    std::cout << "test time trans error" << std::endl;
     return -1;
   }
   if (!std::isfinite(parsedTestSeconds)) {
@@ -85,20 +96,32 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+  endptr = nullptr;
+  errno = 0;
+  long parsedConcurrencyCnt = strtol(argv[7], &endptr, 10);
+  if (errno == ERANGE || endptr == argv[7] || *endptr != '\0') {
+    std::cout << "concurrency count trans error" << std::endl;
+    return -1;
+  }
+  if (parsedConcurrencyCnt <= 0 ||
+      parsedConcurrencyCnt > std::numeric_limits<int>::max()) {
+    std::cerr << "concurrency count overlimit" << std::endl;
+    return -1;
+  }
+
   std::string serverIp(argv[1]);
   int serverPort = parsedPort;
   std::string service(argv[3]);
   std::string method(argv[4]);
   uint64_t payloadLength = parsedPayloadLength;
   double testSeconds = parsedTestSeconds;
+  int concurrencyCnt = parsedConcurrencyCnt;
 
   auto serverAddres = InetAddress(serverIp.data(), serverPort);
 
   EventLoop loop;
   RpcClient client(&loop, serverAddres);
 
-  bool measurementFinished = false;
-  uint64_t receivedFrameCnt = 0;
   std::chrono::steady_clock::time_point start;
   std::string payload(payloadLength, 'A');
   size_t payloadSize = payload.size();
@@ -118,7 +141,7 @@ int main(int argc, char *argv[]) {
 
     if (!validatePass) {
       std::cerr << "fail: " << response.getErrorMessage() << std::endl;
-      printResult(start, receivedFrameCnt, payloadSize);
+      printResult(start, receivedFrameCnt, payloadSize, concurrencyCnt);
       std::abort();
     }
 
@@ -133,13 +156,15 @@ int main(int argc, char *argv[]) {
     if (conn->connected()) {
       start = std::chrono::steady_clock::now();
 
-      loop.runAfter(std::chrono::milliseconds((uint64_t)(testSeconds * 1000)),
-                    [&]() {
-                      measurementFinished = true;
-                      printResult(start, receivedFrameCnt, payloadSize);
-                    });
+      loop.runAfter(
+          std::chrono::milliseconds((uint64_t)(testSeconds * 1000)), [&]() {
+            measurementFinished = true;
+            printResult(start, receivedFrameCnt, payloadSize, concurrencyCnt);
+          });
 
-      clientCall(client, service, method, payload, callbackFunc);
+      for (int i = 0; i < concurrencyCnt; ++i) {
+        clientCall(client, service, method, payload, callbackFunc);
+      }
     } else {
       loop.quit();
     }
@@ -148,6 +173,9 @@ int main(int argc, char *argv[]) {
     std::cerr << "connect error: " << errorCode << std::endl;
     std::abort();
   });
+  if (concurrencyCnt != 1) {
+    client.setMaxPendingRequests(concurrencyCnt);
+  }
   client.setDefaultTimeout(std::chrono::milliseconds(500));
   client.connect();
 

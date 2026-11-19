@@ -41,6 +41,7 @@ add_example(rpc_echo_example)
 add_example(rpc_echo_server_example)
 add_example(rpc_echo_client_example)
 add_example(rpc_calculator_example)
+add_example(rpc_echo_benchmark)
 
 
 include(CTest)

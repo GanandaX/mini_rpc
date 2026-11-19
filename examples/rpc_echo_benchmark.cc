@@ -9,6 +9,7 @@
 bool measurementFinished = false;
 uint64_t sentFrameCnt = 0;
 uint64_t receivedFrameCnt = 0;
+std::chrono::steady_clock::duration requestsDuration;
 
 void clientCall(
     RpcClient &client, std::string &service, std::string &method,
@@ -16,16 +17,20 @@ void clientCall(
     std::function<bool(const RpcResponse &response)> &callbackFunc) {
 
   ++sentFrameCnt;
-  client.call(service, method, payload, [&](const RpcResponse &response) {
-    if (callbackFunc(response)) {
-      clientCall(client, service, method, payload, callbackFunc);
-    } else {
-      ++receivedFrameCnt;
-      if (sentFrameCnt == receivedFrameCnt) {
-        client.disconnect();
-      }
-    }
-  });
+  auto start = std::chrono::steady_clock::now();
+  client.call(service, method, payload,
+              [&, start](const RpcResponse &response) {
+                auto elapsed = std::chrono::steady_clock::now() - start;
+                if (callbackFunc(response)) {
+                  requestsDuration += elapsed;
+                  clientCall(client, service, method, payload, callbackFunc);
+                } else {
+                  ++receivedFrameCnt;
+                  if (sentFrameCnt == receivedFrameCnt) {
+                    client.disconnect();
+                  }
+                }
+              });
 }
 
 void printResult(std::chrono::steady_clock::time_point start,
@@ -35,6 +40,7 @@ void printResult(std::chrono::steady_clock::time_point start,
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - start)
           .count();
+
   std::cout << "max pending cnt: " << concurrencyCnt << std::endl
             << "received frame count: " << receivedFrameCnt << std::endl
             << "elapsed: " << elapsedMilliseconds << " milliseconds"
@@ -42,6 +48,17 @@ void printResult(std::chrono::steady_clock::time_point start,
             << "task/second: "
             << receivedFrameCnt / (elapsedMilliseconds / 1000.0) << std::endl
             << "payload size: " << payloadSize << std::endl;
+
+  if (receivedFrameCnt == 0) {
+    std::cout << "average latency: " << "no samples" << std::endl;
+  } else {
+    double totalMicroseconds =
+        std::chrono::duration<double, std::micro>(requestsDuration).count();
+    double averageMicroseconds = totalMicroseconds / receivedFrameCnt;
+
+    std::cout << "average latency: " << averageMicroseconds << " microseconds"
+              << std::endl;
+  }
 }
 
 int main(int argc, char *argv[]) {

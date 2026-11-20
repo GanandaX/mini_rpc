@@ -1,15 +1,18 @@
-#include <InetAddress.h>
-#include <RpcClient.h>
+#include "InetAddress.h"
+#include "RpcClient.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <limits>
 #include <stdlib.h>
+#include <vector>
 
 bool measurementFinished = false;
 uint64_t sentFrameCnt = 0;
 uint64_t receivedFrameCnt = 0;
 std::chrono::steady_clock::duration requestsDuration;
+std::vector<std::chrono::steady_clock::duration> requestLatencies;
 
 void clientCall(
     RpcClient &client, std::string &service, std::string &method,
@@ -23,6 +26,7 @@ void clientCall(
                 auto elapsed = std::chrono::steady_clock::now() - start;
                 if (callbackFunc(response)) {
                   requestsDuration += elapsed;
+                  requestLatencies.push_back(elapsed);
                   clientCall(client, service, method, payload, callbackFunc);
                 } else {
                   ++receivedFrameCnt;
@@ -48,6 +52,18 @@ void printResult(std::chrono::steady_clock::time_point start,
             << "task/second: "
             << receivedFrameCnt / (elapsedMilliseconds / 1000.0) << std::endl
             << "payload size: " << payloadSize << std::endl;
+
+  std::cout << "p99 latency: ";
+  if (requestLatencies.size()) {
+    std::sort(requestLatencies.begin(), requestLatencies.end());
+    size_t index = requestLatencies.size() - requestLatencies.size() / 100 - 1;
+    std::cout << std::chrono::duration<double, std::micro>(
+                     requestLatencies[index])
+                     .count()
+              << " microseconds" << std::endl;
+  } else {
+    std::cout << "no samples" << std::endl;
+  }
 
   if (receivedFrameCnt == 0) {
     std::cout << "average latency: " << "no samples" << std::endl;

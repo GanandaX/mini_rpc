@@ -384,23 +384,15 @@ void RpcClient::failAllDisreconnectRequests(RpcErrorCode errorCode,
     std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
     auto effectiveTimeout = it->second.reconnectTimeout;
     auto deadline = it->second.deadline;
-    if (deadline.has_value()) {
-      auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) {
-        deadlineTimeout(it->first);
-        continue;
-      }
 
-      auto interval =
-          std::chrono::ceil<std::chrono::milliseconds>(deadline.value() - now);
-      if (effectiveTimeout.count() == 0) {
-        effectiveTimeout = interval;
-      } else {
-        effectiveTimeout = interval.count() > effectiveTimeout.count()
-                               ? effectiveTimeout
-                               : interval;
-      }
+    auto now = std::chrono::steady_clock::now();
+    auto timeoutDecision =
+        calculateEffectiveTimeout(now, deadline, effectiveTimeout);
+    if (timeoutDecision == TimeoutDecision::kExpired) {
+      deadlineTimeout(it->first);
+      continue;
     }
+
     TimerId timerId = loop_->runAfter(
         effectiveTimeout, [&, requestId = it->first, lifetimeToken]() {
           if (lifetimeToken.expired()) {
@@ -500,23 +492,14 @@ void RpcClient::onReconnectTimeout(uint64_t requestId) {
 
   std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
   auto effectiveTimeout = findRes->second.reconnectTimeout;
-  if (deadline.has_value()) {
-    auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      deadlineTimeout(findRes->first);
-      return;
-    }
-
-    auto interval =
-        std::chrono::ceil<std::chrono::milliseconds>(deadline.value() - now);
-    if (effectiveTimeout.count() == 0) {
-      effectiveTimeout = interval;
-    } else {
-      effectiveTimeout = interval.count() > effectiveTimeout.count()
-                             ? effectiveTimeout
-                             : interval;
-    }
+  auto now = std::chrono::steady_clock::now();
+  auto timeoutDecision =
+      calculateEffectiveTimeout(now, deadline, effectiveTimeout);
+  if (timeoutDecision == TimeoutDecision::kExpired) {
+    deadlineTimeout(findRes->first);
+    return;
   }
+
   TimerId timerId =
       loop_->runAfter(effectiveTimeout, [&, requestId, lifetimeToken]() {
         if (lifetimeToken.expired()) {
@@ -595,25 +578,16 @@ void RpcClient::callInLoop(
       const bool canResend = allowReconnect && remainingResends > 0;
 
       auto effectiveTimeout = timeout;
-      if (deadline.has_value()) {
-        auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-          RpcResponse response(requestId, ResponseResult::kUnsuccess,
-                               RpcErrorCode::REQUEST_TIMEOUT, "",
-                               "request timeout");
-          cb(response);
-          return;
-        }
 
-        auto interval = std::chrono::ceil<std::chrono::milliseconds>(
-            deadline.value() - now);
-        if (effectiveTimeout.count() == 0) {
-          effectiveTimeout = interval;
-        } else {
-          effectiveTimeout = interval.count() > effectiveTimeout.count()
-                                 ? effectiveTimeout
-                                 : interval;
-        }
+      auto now = std::chrono::steady_clock::now();
+      auto timeoutDecision =
+          calculateEffectiveTimeout(now, deadline, effectiveTimeout);
+      if (timeoutDecision == TimeoutDecision::kExpired) {
+        RpcResponse response(requestId, ResponseResult::kUnsuccess,
+                             RpcErrorCode::REQUEST_TIMEOUT, "",
+                             "request timeout");
+        cb(response);
+        return;
       }
 
       pendingRequests_[requestId] = {canResend ? service : "",
@@ -627,7 +601,8 @@ void RpcClient::callInLoop(
                                      reconnectTimeout,
                                      std::nullopt,
                                      deadline};
-      if (effectiveTimeout > std::chrono::milliseconds(0)) {
+
+      if (timeoutDecision == TimeoutDecision::kArmTimer) {
         std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
         TimerId timerId =
             loop_->runAfter(effectiveTimeout, [&, requestId, lifetimeToken]() {
@@ -783,25 +758,16 @@ void RpcClient::checkReconnect() {
     auto deadline = it->second.deadline;
     auto requestId = it->first;
     auto cb = it->second.callback;
-    if (deadline.has_value()) {
-      auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) {
-        deadlineTimeout(requestId);
-        continue;
-      }
+    auto now = std::chrono::steady_clock::now();
 
-      auto interval =
-          std::chrono::ceil<std::chrono::milliseconds>(deadline.value() - now);
-      if (effectiveTimeout.count() == 0) {
-        effectiveTimeout = interval;
-      } else {
-        effectiveTimeout = interval.count() > effectiveTimeout.count()
-                               ? effectiveTimeout
-                               : interval;
-      }
+    auto timeoutDecision =
+        calculateEffectiveTimeout(now, deadline, effectiveTimeout);
+    if (timeoutDecision == TimeoutDecision::kExpired) {
+      deadlineTimeout(requestId);
+      continue;
     }
 
-    if (effectiveTimeout > std::chrono::milliseconds(0)) {
+    if (timeoutDecision == TimeoutDecision::kArmTimer) {
       std::weak_ptr<bool> lifetimeToken = lifetimeToken_;
       TimerId timerId =
           loop_->runAfter(effectiveTimeout, [&, requestId, lifetimeToken]() {
@@ -833,4 +799,28 @@ void RpcClient::deadlineTimeout(uint64_t requestId) {
   RpcResponse response(requestId, ResponseResult::kUnsuccess,
                        RpcErrorCode::REQUEST_TIMEOUT, "", "request timeout");
   cb(response);
+}
+
+RpcClient::TimeoutDecision RpcClient::calculateEffectiveTimeout(
+    std::chrono::steady_clock::time_point now,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::chrono::milliseconds &effectiveTimeout) {
+  if (deadline.has_value()) {
+    if (now >= deadline) {
+      return TimeoutDecision::kExpired;
+    }
+
+    auto interval =
+        std::chrono::ceil<std::chrono::milliseconds>(deadline.value() - now);
+    if (effectiveTimeout.count() == 0) {
+      effectiveTimeout = interval;
+    } else {
+      effectiveTimeout = interval.count() > effectiveTimeout.count()
+                             ? effectiveTimeout
+                             : interval;
+    }
+  }
+
+  return effectiveTimeout.count() == 0 ? TimeoutDecision::kNoTimer
+                                       : TimeoutDecision::kArmTimer;
 }

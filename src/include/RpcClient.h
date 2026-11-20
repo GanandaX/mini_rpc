@@ -28,6 +28,36 @@ struct RpcCallOptions {
 };
 
 class RpcClient {
+private:
+  enum class Status { kDisconnected, kConnecting, kDisconnecting, kConnected };
+
+  enum class RequestPhase {
+    kWaitingResponse, // 等待响应
+    kWaitingReconnect // 等待重连
+  };
+
+  enum class TimeoutDecision {
+    kExpired, // 总截止时间已到
+    kNoTimer, // 没有超时限制
+    kArmTimer // 需要设置定时器
+  };
+
+  struct PendingRequest {
+    std::string serviceName;
+    std::string methodName;
+    std::string payload;
+    RpcCallback callback;
+    std::chrono::milliseconds requestTimeout;
+
+    bool allowReconnect;
+    RequestPhase phase;
+    uint8_t remainingResends;
+    std::chrono::milliseconds reconnectTimeout;
+
+    std::optional<TimerId> timerId;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+  };
+
 public:
   explicit RpcClient(EventLoop *loop, const InetAddress &serverAddr);
   ~RpcClient();
@@ -120,30 +150,12 @@ private:
 
   void deadlineTimeout(uint64_t requestId);
 
+  TimeoutDecision calculateEffectiveTimeout(
+      std::chrono::steady_clock::time_point now,
+      std::optional<std::chrono::steady_clock::time_point> deadline,
+      std::chrono::milliseconds &effectiveTimeout);
+
 private:
-  enum class Status { kDisconnected, kConnecting, kDisconnecting, kConnected };
-
-  enum class RequestPhase {
-    kWaitingResponse, // 等待响应
-    kWaitingReconnect // 等待重连
-  };
-
-  struct PendingRequest {
-    std::string serviceName;
-    std::string methodName;
-    std::string payload;
-    RpcCallback callback;
-    std::chrono::milliseconds requestTimeout;
-
-    bool allowReconnect;
-    RequestPhase phase;
-    uint8_t remainingResends;
-    std::chrono::milliseconds reconnectTimeout;
-
-    std::optional<TimerId> timerId;
-    std::optional<std::chrono::steady_clock::time_point> deadline;
-  };
-
   std::shared_ptr<bool> lifetimeToken_;
 
   bool hasConnectAttempted_;

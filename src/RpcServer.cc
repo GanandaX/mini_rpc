@@ -1199,16 +1199,26 @@ void RpcServer::invokeAsyncHandler(const TcpConnectionPtr &conn,
     RpcErrorCode errorCode;
     std::string errorMessage;
 
-    if (res == TaskSubmitResult::kNotRunning) {
+    switch (res) {
+    case TaskSubmitResult::kNotRunning:
       errorCode = RpcErrorCode::INTERNAL_ERROR;
       errorMessage = "task pool not running";
-    } else if (res == TaskSubmitResult::kQueueFull) {
+      break;
+
+    case TaskSubmitResult::kQueueFull:
       workerQueueFullRejections_.fetch_add(1, std::memory_order_relaxed);
       errorCode = RpcErrorCode::RESOURCE_EXHAUSTED;
       errorMessage = "task queue full";
-    } else if (res == TaskSubmitResult::kEmptyTask) {
+      break;
+
+    case TaskSubmitResult::kEmptyTask:
       errorCode = RpcErrorCode::INTERNAL_ERROR;
       errorMessage = "empty task";
+      break;
+
+    default:
+      errorCode = RpcErrorCode::INTERNAL_ERROR;
+      errorMessage = "unknown task submit result";
     }
 
     reply(RpcResult{ResponseResult::kUnsuccess, errorCode, "", errorMessage});

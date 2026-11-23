@@ -96,8 +96,14 @@ public:
 
   bool unregisterMethod(const std::string &service, const std::string &method);
 
+  /**
+   * 仅统计已登记的异步请求，同步请求不受此上限限制
+   */
   void setMaxActiveRequests(size_t maxActiveRequests);
 
+  /**
+   * 仅统计已登记的异步请求，同步请求不受此上限限制
+   */
   void setMaxActiveRequestsPerConnection(size_t maxActiveRequests);
 
   void setMaxMessageSize(size_t maxMessageSize);
